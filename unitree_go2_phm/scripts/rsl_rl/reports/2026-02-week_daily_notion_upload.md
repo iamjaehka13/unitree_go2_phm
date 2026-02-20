@@ -21,8 +21,10 @@
 ## 걷는 영상 (서있는 영상 대체본)
 - ctrl_s45 fresh walk: `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_12-28-03_realobs_single_motor_4k_ctrl_s45_perf/videos/play/walk_fresh_ckpt999.mp4`
 - ctrl_s45 used walk: `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_12-28-03_realobs_single_motor_4k_ctrl_s45_perf/videos/play/walk_used_ckpt999.mp4`
+- ctrl_s45 critical walk: `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_12-28-03_realobs_single_motor_4k_ctrl_s45_perf/videos/play/walk_critical_ckpt999.mp4`
 - critical_exposure_s45 fresh walk: `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_12-28-10_realobs_single_motor_4k_critical_exposure_s45_perf/videos/play/walk_fresh_ckpt999.mp4`
 - critical_exposure_s45 used walk: `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_12-28-10_realobs_single_motor_4k_critical_exposure_s45_perf/videos/play/walk_used_ckpt999.mp4`
+- critical_exposure_s45 critical walk: `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_12-28-10_realobs_single_motor_4k_critical_exposure_s45_perf/videos/play/walk_critical_ckpt999.mp4`
 
 ## 상세 리포트
 - `unitree_go2_phm/scripts/rsl_rl/reports/2026-02-20_latest_runs_growth_journal.md`
