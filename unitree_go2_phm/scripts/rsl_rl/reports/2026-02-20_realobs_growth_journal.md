@@ -124,3 +124,21 @@
 - 평가 결과
   - `unitree_go2_phm/scripts/rsl_rl/outputs/eval_2026_02_20/2026-02-20_00-31-24_realobs_single_motor_3k_std_safe_s43_perf/eval_20260220_113419.json`
   - `unitree_go2_phm/scripts/rsl_rl/outputs/eval_2026_02_20/2026-02-20_00-31-34_realobs_single_motor_3k_std_safe_s44_perf/eval_20260220_114138.json`
+
+## 12) 플레이 영상 (체크포인트별)
+### std_safe_s43 (`2026-02-20_00-31-24_realobs_single_motor_3k_std_safe_s43_perf`)
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-24_realobs_single_motor_3k_std_safe_s43_perf/videos/play/rl-video-step-0_ckpt1000.mp4`
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-24_realobs_single_motor_3k_std_safe_s43_perf/videos/play/rl-video-step-0_ckpt2000.mp4`
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-24_realobs_single_motor_3k_std_safe_s43_perf/videos/play/rl-video-step-0_ckpt2600.mp4`
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-24_realobs_single_motor_3k_std_safe_s43_perf/videos/play/rl-video-step-0_ckpt2999.mp4`
+
+### std_safe_s44 (`2026-02-20_00-31-34_realobs_single_motor_3k_std_safe_s44_perf`)
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-34_realobs_single_motor_3k_std_safe_s44_perf/videos/play/rl-video-step-0_ckpt1000.mp4`
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-34_realobs_single_motor_3k_std_safe_s44_perf/videos/play/rl-video-step-0_ckpt2000.mp4`
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-34_realobs_single_motor_3k_std_safe_s44_perf/videos/play/rl-video-step-0_ckpt2600.mp4`
+- `unitree_go2_phm/scripts/rsl_rl/logs/rsl_rl/unitree_go2_realobs/2026-02-20_00-31-34_realobs_single_motor_3k_std_safe_s44_perf/videos/play/rl-video-step-0_ckpt2999.mp4`
+
+노션 업로드 시 권장 순서:
+1. TensorBoard 3장 (`tb_full_trends`, `tb_boundary_zoom`, `tb_late_phase`)
+2. S43 checkpoint 4개 영상
+3. S44 checkpoint 4개 영상

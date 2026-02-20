@@ -9,3 +9,4 @@ Reinforcement learning framework for PHM (Prognostics and Health Management) of 
 - Paper blueprint (KR): `docs/PAPER_FINAL_BLUEPRINT_KR.txt`
 - Presentation master (KR): `docs/PRESENTATION_3IN1_MASTER_KR.txt`
 - Execution + real-log integration (KR): `docs/PROJECT_EXECUTION_AND_REAL_INTEGRATION_KR.md`
+- Notion upload automation (KR): `unitree_go2_phm/scripts/rsl_rl/reports/NOTION_UPLOAD_RUNBOOK_KR.md`
