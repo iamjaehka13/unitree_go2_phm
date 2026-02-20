@@ -1,0 +1,513 @@
+Real Log Integration Code Playbook
+실로그 연동용 코드 작성 가이드 (파일별/함수별)
+작성일: 2026-02-14
+
+====================================================================
+0) 목적
+====================================================================
+
+이 문서는 아래를 바로 실행 가능한 수준으로 정리한 코드 가이드입니다.
+
+1) 실로봇 로그(500Hz)를 어떻게 받아서
+2) 50Hz governor/평가 뷰로 변환하고
+3) 기존 코드의 어느 파일/함수에 반영할지
+4) 신규 스크립트는 어디에 어떤 구조로 만들지
+
+
+====================================================================
+1) 현재 코드에서 "이미 있는 것" vs "직접 추가해야 하는 것"
+====================================================================
+
+이미 있는 것:
+1) SDK 위치 점검:
+   - `unitree_go2_phm/scripts/real/check_sdk_setup.py`
+2) 실로그 요구사항 문서:
+   - `unitree_go2_phm/scripts/real/REAL_LOG_REQUIREMENTS.txt`
+3) replay governor 구현:
+   - `unitree_go2_phm/scripts/rsl_rl/replay_utils.py`
+4) replay 평가 스크립트:
+   - `unitree_go2_phm/scripts/rsl_rl/evaluate_replay.py`
+
+직접 추가해야 하는 것(권장):
+1) 실시간 governor 실행기:
+   - `unitree_go2_phm/scripts/real/run_governor_live_template.py`
+2) raw log -> replay csv 변환기:
+   - `unitree_go2_phm/scripts/real/log_to_replay_csv.py`
+3) raw log 기반 오프라인 governor 평가기:
+   - `unitree_go2_phm/scripts/real/offline_governor_eval_from_log.py`
+
+
+====================================================================
+2) 파일별 수정 포인트 (기존 코드)
+====================================================================
+
+--------------------------------------------------------------------
+2.1 RealObs 관측식 정렬
+--------------------------------------------------------------------
+파일:
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/mdp/observations/phm_raw.py`
+
+핵심 함수:
+1) `available_voltage_budget_realobs()`
+2) `thermal_stress_realobs()`
+
+실로그 반영 시 점검:
+1) 전압 채널 우선순위:
+   - 실측 `battery_voltage` 우선, fallback은 `battery_voltage_true`.
+2) 온도 채널 우선순위:
+   - case/housing 텐서 우선
+   - 없으면 `coil - delta` proxy
+3) 정규화 범위:
+   - cutoff/warn/crit이 실로그 기준과 일치하는지 확인
+
+변경 예시 (개념):
+1) cutoff 24.5V 유지 여부
+2) coil_to_case_delta_c 기본값 재보정
+
+
+--------------------------------------------------------------------
+2.2 RealObs 보상/종료 기준 정렬
+--------------------------------------------------------------------
+파일:
+1) `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/mdp/rewards/phm.py`
+2) `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/mdp/terminations/health.py`
+3) `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/unitree_go2_realobs_env_cfg.py`
+
+핵심 함수/파라미터:
+1) `thermal_margin_reward_realobs(...)`
+2) `thermal_runaway(..., use_case_proxy=True, ...)`
+3) `brownout_enter_v`, `brownout_recover_v`
+
+실로그 반영 시 점검:
+1) 온도 warning/stop 기준이 실장비 보호 기준과 맞는지
+2) brownout hysteresis 간격(enter/recover)이 채터링을 줄이는지
+3) stop 조건이 하드웨어 보호 이벤트보다 늦지 않은지
+
+
+--------------------------------------------------------------------
+2.3 Replay governor 파라미터 반영
+--------------------------------------------------------------------
+파일:
+1) `unitree_go2_phm/scripts/rsl_rl/replay_utils.py`
+2) `unitree_go2_phm/scripts/rsl_rl/evaluate_replay.py`
+
+핵심 클래스:
+1) `GovernorConfig`
+2) `ThermalVoltageGovernor`
+
+실로그 반영 시 점검:
+1) `temp_warn_c/temp_crit_c/temp_stop_c`
+2) `cell_warn_v/cell_scale_stop_v/cell_hard_stop_v`
+3) `pack_hard_stop_v`
+4) `temp_filter_tau_s/cell_filter_tau_s/pack_filter_tau_s`
+5) `yaw_exponent`
+
+권장 방식:
+1) CLI 인자값으로 먼저 튜닝
+2) 확정 후 기본값으로 반영
+3) 변경 이력을 문서에 날짜와 함께 남김
+
+
+--------------------------------------------------------------------
+2.4 평가 semantics 정렬
+--------------------------------------------------------------------
+파일:
+- `unitree_go2_phm/scripts/rsl_rl/evaluate.py`
+
+핵심 함수:
+1) `_thermal_failure_params()`
+2) `_temperature_tensor_for_eval()`
+3) `apply_scenario()`
+
+의도:
+1) 평가 시 최종 온도 metric이 coil인지 case인지 명확히 고정
+2) 결과 JSON/meta에 semantics가 남도록 유지
+3) 표/그래프 해석 혼선을 방지
+
+
+====================================================================
+3) 신규 스크립트 설계 (권장)
+====================================================================
+
+--------------------------------------------------------------------
+3.1 run_governor_live_template.py
+--------------------------------------------------------------------
+위치:
+- `unitree_go2_phm/scripts/real/run_governor_live_template.py`
+
+역할:
+1) SDK2로 500Hz LowState 수신
+2) 내부 버퍼에 raw 저장
+3) 50Hz 루프에서 governor 계산
+4) 실행 명령(vx/vy/wz) 스케일 및 hard-stop 적용
+5) step 로그(csv) + summary(json) 저장
+
+핵심 구현 함수(권장 시그니처):
+1) `def read_low_state_packet() -> dict:`
+2) `def aggregate_to_50hz(window_packets: list[dict]) -> dict:`
+3) `def apply_governor_and_send(cmd_ref, governor_state) -> dict:`
+4) `def write_step_log(row: dict) -> None:`
+5) `def finalize_summary(rows: list[dict]) -> dict:`
+
+stop reason 분류 필수:
+1) `governor_hard_stop_temp`
+2) `governor_hard_stop_pack`
+3) `governor_hard_stop_cell`
+4) `estop`
+5) `mode_change`
+
+
+--------------------------------------------------------------------
+3.2 log_to_replay_csv.py
+--------------------------------------------------------------------
+위치:
+- `unitree_go2_phm/scripts/real/log_to_replay_csv.py`
+
+역할:
+1) raw 500Hz csv/parquet 입력
+2) 20ms 윈도우 집계
+3) replay/eval에서 쓰는 표준 csv 출력
+
+출력 컬럼(최소):
+1) `t`
+2) `vx_cmd`
+3) `vy_cmd`
+4) `yaw_rate`
+5) `temp_max_c`
+6) `vpack_v`
+7) `vcell_min_v`
+8) `power_w` (가능하면)
+9) `stop_flag` (가능하면)
+
+집계 규칙(고정):
+1) `temp_max_c`: 윈도우 max
+2) `vcell_min_v`: 윈도우 min
+3) `vpack_v`: 윈도우 last (또는 mean, 하나로 고정)
+4) `vx/vy/wz`: command 타임스탬프 동기화 기준
+
+
+--------------------------------------------------------------------
+3.3 offline_governor_eval_from_log.py
+--------------------------------------------------------------------
+위치:
+- `unitree_go2_phm/scripts/real/offline_governor_eval_from_log.py`
+
+역할:
+1) 실로그로 governor를 오프라인 재생
+2) ON/OFF 결과를 정량 비교
+3) summary json 출력
+
+입력:
+1) 50Hz 표준 로그(csv)
+2) governor 파라미터(인자)
+
+출력 지표(최소):
+1) `time_temp_over_warn_s`
+2) `vpack_min_v`
+3) `vcell_min_v`
+4) `mean_scale_lin`
+5) `time_scale_lt_0p9_s`
+6) `yaw_mae_exec` (가능 시)
+7) `hard_stop_reason_counts`
+
+
+====================================================================
+4) 코드 템플릿: 무엇을 어디에 써야 하는지
+====================================================================
+
+아래 템플릿은 "바로 붙여넣기 후 SDK 부분만 채우는" 용도입니다.
+
+--------------------------------------------------------------------
+4.1 run_governor_live_template.py (핵심 루프)
+--------------------------------------------------------------------
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import time
+from collections import deque
+from pathlib import Path
+
+import sys
+from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+_RSL_RL_DIR = _THIS_DIR.parent / "rsl_rl"
+if str(_RSL_RL_DIR) not in sys.path:
+    sys.path.insert(0, str(_RSL_RL_DIR))
+from replay_utils import GovernorConfig, ThermalVoltageGovernor
+
+
+def aggregate_to_50hz(window_packets):
+    # window_packets: 20ms 구간의 500Hz packet 리스트
+    # packet 예시 키:
+    # - temp_12: list[12]
+    # - vpack: float
+    # - vcell_8: list[8]
+    # - wz_actual: float
+    # - vx_cmd, vy_cmd, wz_cmd: float
+    temps = [max(p["temp_12"]) for p in window_packets]
+    vcells = [min(p["vcell_8"]) for p in window_packets]
+    vpack_last = window_packets[-1]["vpack"]
+    p_last = window_packets[-1]
+    return {
+        "temp_max_c": max(temps),
+        "vcell_min_v": min(vcells),
+        "vpack_v": vpack_last,
+        "vx_cmd": p_last["vx_cmd"],
+        "vy_cmd": p_last["vy_cmd"],
+        "wz_cmd": p_last["wz_cmd"],
+        "wz_actual": p_last.get("wz_actual", 0.0),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out_dir", type=str, default="./real_runs")
+    parser.add_argument("--duration_s", type=float, default=120.0)
+    parser.add_argument("--temp_warn_c", type=float, default=65.0)
+    parser.add_argument("--temp_crit_c", type=float, default=70.0)
+    parser.add_argument("--temp_stop_c", type=float, default=72.0)
+    parser.add_argument("--cell_warn_v", type=float, default=3.20)
+    parser.add_argument("--cell_stop_v", type=float, default=3.05)
+    parser.add_argument("--cell_hard_v", type=float, default=3.00)
+    parser.add_argument("--pack_stop_v", type=float, default=24.5)
+    args = parser.parse_args()
+
+    cfg = GovernorConfig(
+        temp_warn_c=args.temp_warn_c,
+        temp_crit_c=args.temp_crit_c,
+        temp_stop_c=args.temp_stop_c,
+        cell_warn_v=args.cell_warn_v,
+        cell_scale_stop_v=args.cell_stop_v,
+        cell_hard_stop_v=args.cell_hard_v,
+        pack_hard_stop_v=args.pack_stop_v,
+    )
+    gov = ThermalVoltageGovernor(cfg)
+    gov.reset()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    step_path = out_dir / "steps.csv"
+    summary_path = out_dir / "summary.json"
+
+    with step_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "t_s","temp_max_c","vcell_min_v","vpack_v",
+                "vx_cmd_raw","vy_cmd_raw","wz_cmd_raw",
+                "vx_cmd_exec","vy_cmd_exec","wz_cmd_exec",
+                "scale_lin","scale_yaw","hard_stop","stop_reason"
+            ],
+        )
+        writer.writeheader()
+
+        # TODO: SDK 수신 루프 연결
+        # 예시 흐름:
+        # - 500Hz로 packet 수신
+        # - 20ms마다 window_packets를 aggregate_to_50hz
+        # - governor.step 호출
+        # - 스케일 적용 명령 전송
+        # - CSV 기록
+        pass
+
+    # TODO: 요약 통계 계산 후 summary.json 저장
+    summary = {"status": "template_only", "note": "fill SDK loop and summary reducer"}
+    with summary_path.open("w") as f:
+        json.dump(summary, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+
+--------------------------------------------------------------------
+4.2 log_to_replay_csv.py (표준화 변환)
+--------------------------------------------------------------------
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_csv", type=str, required=True)
+    parser.add_argument("--output_csv", type=str, required=True)
+    parser.add_argument("--window_ms", type=int, default=20)
+    args = parser.parse_args()
+
+    # TODO:
+    # 1) input_csv 읽기 (500Hz raw)
+    # 2) window_ms 단위로 그룹핑
+    # 3) temp max / vcell min / vpack last 집계
+    # 4) replay 호환 컬럼으로 output_csv 작성
+    #
+    # 최소 출력 컬럼:
+    # t, vx, vy, yaw_rate
+    #
+    # 확장 컬럼(권장):
+    # temp_max_c, vpack_v, vcell_min_v, power_w
+
+    out = Path(args.output_csv)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["t", "vx", "vy", "yaw_rate"])
+        writer.writeheader()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+
+--------------------------------------------------------------------
+4.3 offline_governor_eval_from_log.py (오프라인 재평가)
+--------------------------------------------------------------------
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from pathlib import Path
+
+import sys
+from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+_RSL_RL_DIR = _THIS_DIR.parent / "rsl_rl"
+if str(_RSL_RL_DIR) not in sys.path:
+    sys.path.insert(0, str(_RSL_RL_DIR))
+from replay_utils import GovernorConfig, ThermalVoltageGovernor
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_csv", type=str, required=True)
+    parser.add_argument("--output_json", type=str, required=True)
+    parser.add_argument("--dt", type=float, default=0.02)
+    parser.add_argument("--governor", action="store_true", default=False)
+    args = parser.parse_args()
+
+    cfg = GovernorConfig()
+    gov = ThermalVoltageGovernor(cfg)
+    gov.reset()
+
+    rows = []
+    with open(args.input_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            temp = float(r.get("temp_max_c", 25.0))
+            vcell = float(r.get("vcell_min_v", 4.2))
+            vpack = float(r.get("vpack_v", 33.6))
+            vx = float(r.get("vx", 0.0))
+            vy = float(r.get("vy", 0.0))
+            wz = float(r.get("yaw_rate", 0.0))
+
+            if args.governor:
+                s_lin, s_yaw, hard_stop, dbg = gov.step(args.dt, temp, vcell, vpack)
+            else:
+                s_lin, s_yaw, hard_stop = 1.0, 1.0, False
+                dbg = {}
+
+            rows.append(
+                {
+                    "temp_max_c": temp,
+                    "vcell_min_v": vcell,
+                    "vpack_v": vpack,
+                    "vx_exec": vx * s_lin,
+                    "vy_exec": vy * s_lin,
+                    "wz_exec": wz * s_yaw,
+                    "scale_lin": s_lin,
+                    "scale_yaw": s_yaw,
+                    "hard_stop": hard_stop,
+                    "dbg": dbg,
+                }
+            )
+            if hard_stop:
+                break
+
+    # TODO: time_temp_over_warn_s, min voltage, mean scale 등 요약 계산
+    summary = {
+        "num_steps": len(rows),
+        "hard_stop": bool(any(r["hard_stop"] for r in rows)),
+    }
+    out = Path(args.output_json)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w") as f:
+        json.dump(summary, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+
+====================================================================
+5) 실로그 보정 후 "반드시" 확인할 검증 항목
+====================================================================
+
+1) 기본 안전:
+- hard-stop이 하드웨어 보호 이벤트보다 늦지 않은가
+
+2) 성능-안전 tradeoff:
+- ON/OFF 비교 시
+  time_temp_over_warn_s 감소가 있는가
+  yaw_mae 악화가 과도하지 않은가
+
+3) 전압 안정성:
+- vpack_min_v, vcell_min_v가 margin 내에서 관리되는가
+
+4) 해석 일관성:
+- 결과표에 온도 semantics(coil/case)가 명시되어 있는가
+
+5) 재현성:
+- 동일 로그로 재실행 시 같은 summary가 나오는가
+
+
+====================================================================
+6) 권장 작업 순서 (실무)
+====================================================================
+
+1) 템플릿 3개 파일 생성/복사
+2) SDK 수신 루프 연결(run_governor_live_template.py)
+3) raw->50Hz 변환기(log_to_replay_csv.py) 완성
+4) 오프라인 governor 평가기(offine_governor_eval_from_log.py) 완성
+5) threshold/필터 파라미터 보정
+6) 기존 evaluate_replay 결과와 같은 포맷 summary 통일
+
+
+====================================================================
+7) 빠른 체크 커맨드
+====================================================================
+
+1) SDK 위치 점검:
+`python unitree_go2_phm/scripts/real/check_sdk_setup.py`
+
+2) raw->replay csv 변환:
+`python unitree_go2_phm/scripts/real/log_to_replay_csv.py --input_csv <raw.csv> --output_csv <replay.csv>`
+
+3) 오프라인 governor 평가:
+`python unitree_go2_phm/scripts/real/offline_governor_eval_from_log.py --input_csv <replay.csv> --output_json <summary.json> --governor`
+
+
+====================================================================
+8) 메모
+====================================================================
+
+1) 실기 코드는 항상 stop reason과 mode transition을 함께 기록하세요.
+2) raw 로그는 절대 덮어쓰지 말고, 파생 파일만 별도 경로에 저장하세요.
+3) 수치 보정은 한 번에 여러 축을 바꾸지 말고, 한 축씩 바꾸고 결과를 비교하세요.

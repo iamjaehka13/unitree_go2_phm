@@ -1,0 +1,224 @@
+1/2/3 트랙 최종 실행 런북 (헷갈림 방지판)
+작성일: 2026-02-14
+
+====================================================================
+0) 결론 먼저 (핵심)
+====================================================================
+
+1) 1번(PHM):
+- 역할: 상한선 + Teacher
+- 사용 위치: 시뮬레이션
+- Real 메인 정책으로 직접 사용: 보통 NO
+
+2) 2번(Baseline):
+- 역할: 공정 비교군
+- Teacher-Student 사용: NO (보통 scratch)
+- Real 비교 실험: YES
+
+3) 3번(RealObs):
+- 역할: 실측 채널 기반 메인 정책
+- Teacher-Student 사용: YES (1번 teacher -> 3번 student)
+- Real 메인 실험: YES
+
+즉, 네 질문에 대한 한 줄 답:
+"1번은 teacher/상한선, real 비교는 2번 vs 3번, teacher-student는 3번에만 적용."
+
+
+====================================================================
+1) 지금부터 뭘 할지 (실행 순서)
+====================================================================
+
+Step 1. Teacher(1번) 학습 (sim)
+목적:
+- privileged 정보로 가능한 상한 성능 확보
+
+명령:
+python unitree_go2_phm/scripts/rsl_rl/train.py \
+  --task Unitree-Go2-Phm-v1 \
+  --num_envs 4096 \
+  --max_iterations 3000 \
+  --headless
+
+산출물:
+- `logs/rsl_rl/unitree_go2_phm_strategic/<run>/model_*.pt`
+
+
+Step 2. Baseline(2번) 학습 (sim, scratch)
+목적:
+- PHM 정보/보상 없이 같은 물리에서 학습한 비교군 확보
+
+명령:
+python unitree_go2_phm/scripts/rsl_rl/train.py \
+  --task Unitree-Go2-Baseline-v1 \
+  --num_envs 4096 \
+  --max_iterations 3000 \
+  --headless
+
+산출물:
+- `logs/rsl_rl/unitree_go2_baseline/<run>/model_*.pt`
+
+
+Step 3. RealObs(3번) 학생 정책 만들기 (teacher-student)
+목적:
+- 1번 teacher 전략을 실측 채널 정책(3번 student)으로 이전
+
+명령:
+python unitree_go2_phm/scripts/rsl_rl/distill_teacher_student.py \
+  --teacher_task Unitree-Go2-Phm-v1 \
+  --student_task Unitree-Go2-RealObs-v1 \
+  --teacher_checkpoint logs/rsl_rl/unitree_go2_phm_strategic/<teacher_run>/model_2999.pt \
+  --num_envs 1024 \
+  --num_updates 2000 \
+  --steps_per_update 24 \
+  --fixed_risk_factor 1.0 \
+  --dagger_start_beta 1.0 \
+  --dagger_end_beta 0.2 \
+  --run_name distill_seed42 \
+  --headless
+
+산출물:
+- `logs/rsl_rl/unitree_go2_realobs/<distill_run>/student_distill_final.pt`
+
+
+Step 4. RealObs(3번) finetune (sim)
+목적:
+- student를 RealObs 환경에서 PPO로 추가 최적화
+
+명령:
+python unitree_go2_phm/scripts/rsl_rl/train.py \
+  --task Unitree-Go2-RealObs-v1 \
+  --resume \
+  --load_run <distill_run> \
+  --checkpoint student_distill_final.pt \
+  --num_envs 4096 \
+  --max_iterations 2000 \
+  --run_name finetune_seed42 \
+  --headless
+
+산출물:
+- `logs/rsl_rl/unitree_go2_realobs/<finetune_run>/model_*.pt`
+
+
+Step 5. Sim 평가 (표/그림 기본 근거)
+
+5-1) 시나리오 평가 (권장)
+python unitree_go2_phm/scripts/rsl_rl/evaluate.py \
+  --task Unitree-Go2-Baseline-v1 \
+  --checkpoint logs/rsl_rl/unitree_go2_baseline/<run>/model_2999.pt \
+  --num_envs 512 \
+  --num_episodes 100 \
+  --output_dir ./eval_results/baseline \
+  --headless
+
+python unitree_go2_phm/scripts/rsl_rl/evaluate.py \
+  --task Unitree-Go2-RealObs-v1 \
+  --checkpoint logs/rsl_rl/unitree_go2_realobs/<finetune_run>/model_1999.pt \
+  --num_envs 512 \
+  --num_episodes 100 \
+  --output_dir ./eval_results/realobs \
+  --headless
+
+5-2) replay ON/OFF + fault (권장)
+python unitree_go2_phm/scripts/rsl_rl/evaluate_replay.py \
+  --task Unitree-Go2-RealObs-v1 \
+  --checkpoint logs/rsl_rl/unitree_go2_realobs/<finetune_run>/model_1999.pt \
+  --command_file unitree_go2_phm/scripts/rsl_rl/replay_commands/s1_thermal_cruise.yaml \
+  --num_trials 3 \
+  --risk_factor_fixed 1.0 \
+  --output_dir ./replay_results/off \
+  --headless
+
+python unitree_go2_phm/scripts/rsl_rl/evaluate_replay.py \
+  --task Unitree-Go2-RealObs-v1 \
+  --checkpoint logs/rsl_rl/unitree_go2_realobs/<finetune_run>/model_1999.pt \
+  --command_file unitree_go2_phm/scripts/rsl_rl/replay_commands/s1_thermal_cruise.yaml \
+  --num_trials 3 \
+  --governor \
+  --fault_leg RL \
+  --fault_kp_scale 0.6 \
+  --fault_kd_scale 1.0 \
+  --fault_start_s 5.0 \
+  --risk_factor_fixed 1.0 \
+  --output_dir ./replay_results/on_fault \
+  --headless
+
+
+Step 6. Real 비교 실험 (실기)
+목적:
+- 2번 vs 3번을 같은 replay/teleop 조건에서 비교
+
+원칙:
+1) Baseline(2번)과 RealObs(3번) 모두 같은 실험 프로파일 사용
+2) command, 바닥, 시작 SOC, ambient를 고정
+3) stop reason 분해 로깅 필수
+
+사용 스크립트(템플릿):
+1) `unitree_go2_phm/scripts/real/run_governor_live_template.py`
+2) `unitree_go2_phm/scripts/real/log_to_replay_csv.py`
+3) `unitree_go2_phm/scripts/real/offline_governor_eval_from_log.py`
+
+
+====================================================================
+2) Teacher-Student를 어디에 쓰는지 (딱 정리)
+====================================================================
+
+1) Baseline(2번):
+- teacher-student 안 씀 (NO)
+- 이유: 공정 비교군은 단순/독립적으로 유지해야 해석이 쉬움
+
+2) RealObs(3번):
+- teacher-student 씀 (YES)
+- teacher는 1번(PHM)
+- 이유: privileged 전략을 실측 채널 정책으로 이전
+
+
+====================================================================
+3) 교수님께 보고할 표 구성 (최소 세트)
+====================================================================
+
+표 A. Sim 시나리오 비교
+1) Baseline(2) vs RealObs(3)
+2) Fresh/Used/Aged/Critical
+3) Survival, TrackErr, MeanPower, MaxTemp
+
+표 B. Sim replay 비교
+1) RealObs(3) governor OFF vs ON
+2) completed_rate, yaw_mae_exec, time_temp_over_warn_s, vpack_min_v
+
+표 C. Real 실험 비교
+1) Baseline(2) vs RealObs(3)
+2) 동일 command 프로파일/환경 조건
+3) 안전/성능 지표 동일 포맷으로 비교
+
+
+====================================================================
+4) 자주 헷갈리는 포인트 (오해 방지)
+====================================================================
+
+1) "1번을 real에서 아예 못 쓰나?"
+- 기술적으로 가능할 수는 있지만, 메인 claim으로는 비권장.
+- 이유: latent 의존이 있어 실측 기반 주장에 불리.
+
+2) "2번도 real에서 해야 하나?"
+- YES, 비교군으로 real에 반드시 필요.
+
+3) "3번은 꼭 distill 해야 하나?"
+- 강력 권장.
+- 시간 여유 있으면 3번 scratch도 추가해 distill 효과까지 비교.
+
+4) "결국 메인 실험은?"
+- real에서 2번 vs 3번 비교가 메인.
+- 1번은 teacher/상한선 근거.
+
+
+====================================================================
+5) 오늘 바로 할 일 (실행 체크리스트)
+====================================================================
+
+1) teacher(1번) 최종 체크포인트 확정
+2) baseline(2번) 체크포인트 확정
+3) realobs distill+finetune 체크포인트 확정
+4) replay 프로파일 3개 고정
+5) real 로그 포맷/집계 규칙 고정 (500Hz raw -> 50Hz derived)
+6) 표 A/B/C 템플릿 파일 만들어 결과값만 꽂기
+7) 상수 보정 문서 확인: `REAL_CONSTANTS_CALIBRATION_KR.txt`

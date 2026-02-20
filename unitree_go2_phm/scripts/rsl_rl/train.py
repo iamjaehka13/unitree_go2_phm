@@ -1,0 +1,613 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Script to train RL agent with RSL-RL."""
+
+"""Launch Isaac Sim Simulator first."""
+
+import argparse
+import math
+import os
+import sys
+
+# Deterministic CuBLAS config must be set before torch/CUDA context is initialized.
+# Keep user's explicit setting if already provided.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+from isaaclab.app import AppLauncher
+
+# local imports
+import cli_args  # isort: skip
+
+# add argparse arguments
+parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument(
+    "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
+)
+parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--num_steps_per_env",
+    type=int,
+    default=None,
+    help="Override PPO rollout horizon (steps per environment, per iteration).",
+)
+parser.add_argument(
+    "--num_mini_batches",
+    type=int,
+    default=None,
+    help="Override PPO mini-batch count per update (higher increases update compute).",
+)
+parser.add_argument(
+    "--num_learning_epochs",
+    type=int,
+    default=None,
+    help="Override PPO learning epochs per update (higher increases update compute).",
+)
+parser.add_argument(
+    "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
+)
+parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
+)
+parser.add_argument(
+    "--debug_startup",
+    action="store_true",
+    default=False,
+    help="Enable verbose startup tracing and a one-step warmup before runner construction.",
+)
+parser.add_argument(
+    "--perf_mode",
+    action="store_true",
+    default=False,
+    help="Use throughput-oriented backend settings (non-deterministic, TF32 enabled).",
+)
+# append RSL-RL cli arguments
+cli_args.add_rsl_rl_args(parser)
+# append AppLauncher cli args
+AppLauncher.add_app_launcher_args(parser)
+args_cli, hydra_args = parser.parse_known_args()
+
+# always enable cameras to record video
+if args_cli.video:
+    args_cli.enable_cameras = True
+
+# clear out sys.argv for Hydra
+sys.argv = [sys.argv[0]] + hydra_args
+
+# launch omniverse app
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import carb
+carb.settings.get_settings().set_int("/log/channels/omni.physx.tensors.plugin/level", 1)
+
+"""Check for minimum supported RSL-RL version."""
+
+import importlib.metadata as metadata
+import platform
+from packaging import version
+
+# check minimum supported rsl-rl version
+RSL_RL_VERSION = "3.0.1"
+installed_version = metadata.version("rsl-rl-lib")
+if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
+    if platform.system() == "Windows":
+        cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+    else:
+        cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+    print(
+        f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
+        f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
+        f"\n\n\t{' '.join(cmd)}\n"
+    )
+    exit(1)
+
+"""Rest everything follows."""
+
+import gymnasium as gym
+import logging
+import random
+import time
+import torch
+import numpy as np
+from datetime import datetime
+
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+
+from isaaclab.envs import (
+    DirectMARLEnv,
+    DirectMARLEnvCfg,
+    DirectRLEnvCfg,
+    ManagerBasedRLEnvCfg,
+    multi_agent_to_single_agent,
+)
+from isaaclab.utils.dict import print_dict
+from isaaclab.utils.io import dump_yaml
+
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+
+import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.utils import get_checkpoint_path
+from isaaclab_tasks.utils.hydra import hydra_task_config
+
+# import logger
+logger = logging.getLogger(__name__)
+
+import unitree_go2_phm.tasks  # noqa: F401
+
+def _configure_torch_runtime(perf_mode: bool) -> None:
+    """Configure backend flags for either reproducibility or throughput."""
+    if perf_mode:
+        # Throughput mode for faster training on Ampere+ GPUs (e.g., RTX 3090).
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.use_deterministic_algorithms(False)
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        logger.warning(
+            "[Runtime] PERF mode enabled: TF32=ON, deterministic=OFF, cudnn.benchmark=ON (results may vary run-to-run)."
+        )
+        return
+
+    # Reproducibility-first defaults for paper experiments.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    logger.info("[Runtime] Deterministic mode enabled: TF32=OFF, cudnn.benchmark=OFF.")
+
+
+def _piecewise_stage_value(
+    iter_idx: int,
+    stage1_end_iter: int,
+    stage2_end_iter: int,
+    stage0_value: float,
+    stage1_value: float,
+    stage2_value: float,
+) -> float:
+    """3-stage piecewise constant schedule value by absolute learning iteration."""
+    if iter_idx < int(stage1_end_iter):
+        return float(stage0_value)
+    if iter_idx < int(stage2_end_iter):
+        return float(stage1_value)
+    return float(stage2_value)
+
+
+def _set_runner_entropy_coef(runner: OnPolicyRunner | DistillationRunner, entropy_coef: float) -> bool:
+    """Set entropy coefficient on runner algorithm if supported."""
+    alg = getattr(runner, "alg", None)
+    if alg is None or not hasattr(alg, "entropy_coef"):
+        return False
+    setattr(alg, "entropy_coef", float(entropy_coef))
+    return True
+
+
+def _set_runner_action_std_cap_only(
+    runner: OnPolicyRunner | DistillationRunner,
+    target_std: float,
+    prev_applied_log: torch.Tensor | None = None,
+    enable_rate_limit: bool = False,
+    max_up_log: float = 0.0,
+    max_down_log: float = 0.0,
+) -> tuple[bool, float, float | None, float | None, float | None, torch.Tensor | None]:
+    """Apply action-std with cap-only semantics and optional target-tracking log-space slew limiter."""
+    alg = getattr(runner, "alg", None)
+    policy = getattr(alg, "policy", None) if alg is not None else None
+    if policy is None:
+        return False, max(float(target_std), 1e-6), None, None, None, None
+    std_value = max(float(target_std), 1e-6)
+    with torch.no_grad():
+        cap_value_log = math.log(std_value)
+        if hasattr(policy, "std"):
+            # Some policy variants expose std directly. We still rate-limit in log-space.
+            current_std = torch.clamp(policy.std.data, min=1e-6)
+            current_mean = float(current_std.mean().item())
+            cap_std_tensor = torch.full_like(current_std, std_value)
+            cap_log_tensor = torch.full_like(current_std, cap_value_log)
+
+            # Cap-only semantics: never increase exploration std at stage boundaries.
+            capped_std = torch.minimum(current_std, cap_std_tensor)
+            capped_log = torch.log(torch.clamp(capped_std, min=1e-6))
+
+            applied_log = capped_log
+            prev_mean = None
+            if enable_rate_limit:
+                prev_log = prev_applied_log
+                if prev_log is None or prev_log.shape != capped_log.shape:
+                    prev_log = capped_log.clone()
+                else:
+                    prev_log = prev_log.to(device=capped_log.device, dtype=capped_log.dtype)
+                prev_mean = float(torch.exp(prev_log).mean().item())
+                # Recovery mode: move from previous applied std toward target cap (not toward current std).
+                desired_log = cap_log_tensor
+                diff = torch.clamp(desired_log - prev_log, min=-float(max_down_log), max=float(max_up_log))
+                applied_log = prev_log + diff
+                # Preserve cap-only invariant even under limiter dynamics.
+                applied_log = torch.minimum(applied_log, cap_log_tensor)
+
+            applied_std = torch.exp(applied_log)
+            policy.std.data.copy_(applied_std)
+            applied_mean = float(applied_std.mean().item())
+            return True, std_value, current_mean, prev_mean, applied_mean, applied_log.detach().clone()
+        if hasattr(policy, "log_std"):
+            current_log_std = policy.log_std.data
+            current_mean = float(torch.exp(current_log_std).mean().item())
+            cap_log_tensor = torch.full_like(current_log_std, cap_value_log)
+            # Cap-only semantics in log-space for log_std policies.
+            capped_log = torch.minimum(current_log_std, cap_log_tensor)
+
+            applied_log_std = capped_log
+            prev_mean = None
+            if enable_rate_limit:
+                prev_log = prev_applied_log
+                if prev_log is None or prev_log.shape != capped_log.shape:
+                    prev_log = capped_log.clone()
+                else:
+                    prev_log = prev_log.to(device=capped_log.device, dtype=capped_log.dtype)
+                prev_mean = float(torch.exp(prev_log).mean().item())
+                # Recovery mode: move from previous applied std toward target cap (not toward current std).
+                desired_log = cap_log_tensor
+                diff = torch.clamp(desired_log - prev_log, min=-float(max_down_log), max=float(max_up_log))
+                applied_log_std = prev_log + diff
+                # Preserve cap-only invariant even under limiter dynamics.
+                applied_log_std = torch.minimum(applied_log_std, cap_log_tensor)
+
+            policy.log_std.data.copy_(applied_log_std)
+            applied_mean = float(torch.exp(applied_log_std).mean().item())
+            return True, std_value, current_mean, prev_mean, applied_mean, applied_log_std.detach().clone()
+    return False, std_value, None, None, None, None
+
+
+def _learn_with_exploration_schedule(
+    runner: OnPolicyRunner | DistillationRunner,
+    agent_cfg: RslRlBaseRunnerCfg,
+    debug_startup: bool = False,
+) -> None:
+    """
+    Train with staged entropy/action-std schedule.
+
+    Default target profile:
+      - entropy: 0.01 (iter < 1000), 0.005 (1000~1999), 0.003 (>=2000)
+      - action std target-cap: 1.0 (iter < 1000), 0.7 (1000~1999), 0.5 (>=2000)
+      - optional late limiter (default on): iter>=2200, segment=20, up=1.02x, down=1.00x(disabled)
+    """
+    total_iters = int(agent_cfg.max_iterations)
+    if total_iters <= 0:
+        return
+
+    entropy_enable = bool(getattr(agent_cfg, "entropy_schedule_enable", True))
+    entropy_stage1_end = int(getattr(agent_cfg, "entropy_stage1_end_iter", 1000))
+    entropy_stage2_end = int(getattr(agent_cfg, "entropy_stage2_end_iter", 2000))
+    entropy_stage0 = float(getattr(agent_cfg, "entropy_stage0_value", 0.01))
+    entropy_stage1 = float(getattr(agent_cfg, "entropy_stage1_value", 0.005))
+    entropy_stage2 = float(getattr(agent_cfg, "entropy_stage2_value", 0.003))
+
+    std_enable = bool(getattr(agent_cfg, "action_std_schedule_enable", True))
+    std_stage1_end = int(getattr(agent_cfg, "action_std_stage1_end_iter", 1000))
+    std_stage2_end = int(getattr(agent_cfg, "action_std_stage2_end_iter", 2000))
+    std_stage0 = float(getattr(agent_cfg, "action_std_stage0_value", 1.0))
+    std_stage1 = float(getattr(agent_cfg, "action_std_stage1_value", 0.7))
+    std_stage2 = float(getattr(agent_cfg, "action_std_stage2_value", 0.5))
+    std_late_rate_limit_enable = bool(getattr(agent_cfg, "action_std_late_rate_limit_enable", True))
+    std_late_rate_limit_start_iter = int(getattr(agent_cfg, "action_std_late_rate_limit_start_iter", 2200))
+    std_late_rate_limit_segment_iters = max(int(getattr(agent_cfg, "action_std_late_rate_limit_segment_iters", 20)), 1)
+    std_late_max_up_factor = max(float(getattr(agent_cfg, "action_std_late_max_up_factor", 1.02)), 1.0)
+    std_late_max_down_factor = max(float(getattr(agent_cfg, "action_std_late_max_down_factor", 1.00)), 1.0)
+    std_late_max_up_log = math.log(std_late_max_up_factor) if std_late_max_up_factor > 0.0 else 0.0
+    std_late_max_down_log = math.log(std_late_max_down_factor) if std_late_max_down_factor > 0.0 else 0.0
+
+    start_iter = int(getattr(runner, "current_learning_iteration", 0))
+    final_iter = start_iter + total_iters
+
+    boundaries = {start_iter, final_iter}
+    if entropy_enable:
+        if start_iter < entropy_stage1_end < final_iter:
+            boundaries.add(entropy_stage1_end)
+        if start_iter < entropy_stage2_end < final_iter:
+            boundaries.add(entropy_stage2_end)
+    if std_enable:
+        if start_iter < std_stage1_end < final_iter:
+            boundaries.add(std_stage1_end)
+        if start_iter < std_stage2_end < final_iter:
+            boundaries.add(std_stage2_end)
+        # Late phase segmentation to enable per-segment std limiter updates.
+        if std_late_rate_limit_enable:
+            seg_anchor = max(start_iter, std_late_rate_limit_start_iter)
+            if start_iter < std_late_rate_limit_start_iter < final_iter:
+                boundaries.add(std_late_rate_limit_start_iter)
+                seg_anchor = std_late_rate_limit_start_iter
+            if seg_anchor < final_iter:
+                b = seg_anchor + std_late_rate_limit_segment_iters
+                while b < final_iter:
+                    boundaries.add(b)
+                    b += std_late_rate_limit_segment_iters
+    phase_bounds = sorted(boundaries)
+
+    first_phase = True
+    std_prev_applied_log: torch.Tensor | None = None
+    std_late_rate_initialized = False
+    for phase_idx in range(len(phase_bounds) - 1):
+        seg_start = int(phase_bounds[phase_idx])
+        seg_end = int(phase_bounds[phase_idx + 1])
+        seg_iters = seg_end - seg_start
+        if seg_iters <= 0:
+            continue
+
+        # Avoid duplicate "boundary iteration" when calling runner.learn() multiple times.
+        runner.current_learning_iteration = seg_start
+
+        entropy_value = None
+        entropy_set = False
+        if entropy_enable:
+            entropy_value = _piecewise_stage_value(
+                iter_idx=seg_start,
+                stage1_end_iter=entropy_stage1_end,
+                stage2_end_iter=entropy_stage2_end,
+                stage0_value=entropy_stage0,
+                stage1_value=entropy_stage1,
+                stage2_value=entropy_stage2,
+            )
+            entropy_set = _set_runner_entropy_coef(runner, entropy_value)
+
+        std_target_value = None
+        std_set = False
+        std_current_mean = None
+        std_prev_mean = None
+        std_applied_mean = None
+        std_rate_limit_on = False
+        if std_enable:
+            std_target_value = _piecewise_stage_value(
+                iter_idx=seg_start,
+                stage1_end_iter=std_stage1_end,
+                stage2_end_iter=std_stage2_end,
+                stage0_value=std_stage0,
+                stage1_value=std_stage1,
+                stage2_value=std_stage2,
+            )
+            std_rate_limit_on = bool(
+                std_late_rate_limit_enable
+                and seg_start >= std_late_rate_limit_start_iter
+                and (std_late_max_up_log > 0.0 or std_late_max_down_log > 0.0)
+            )
+            prev_for_call = std_prev_applied_log
+            # Initialize limiter without shock at first activation.
+            if std_rate_limit_on and not std_late_rate_initialized:
+                prev_for_call = None
+            std_set, std_target_value, std_current_mean, std_prev_mean, std_applied_mean, std_prev_applied_log = _set_runner_action_std_cap_only(
+                runner,
+                std_target_value,
+                prev_applied_log=prev_for_call,
+                enable_rate_limit=std_rate_limit_on,
+                max_up_log=std_late_max_up_log,
+                max_down_log=std_late_max_down_log,
+            )
+            if std_set and std_rate_limit_on:
+                std_late_rate_initialized = True
+
+        if debug_startup:
+            print(
+                "[DBG] Exploration schedule phase "
+                f"{phase_idx + 1}/{len(phase_bounds) - 1}: iter[{seg_start},{seg_end}) "
+                f"entropy={entropy_value if entropy_set else 'N/A'} "
+                f"action_std_target={std_target_value if std_set else 'N/A'} "
+                f"action_std_current={std_current_mean if std_set else 'N/A'} "
+                f"action_std_prev={std_prev_mean if std_set and std_prev_mean is not None else 'N/A'} "
+                f"action_std_applied={std_applied_mean if std_set else 'N/A'} "
+                f"action_std_rate_limit={'ON' if std_rate_limit_on else 'OFF'}",
+                flush=True,
+            )
+        else:
+            logging.info(
+                "[TrainSchedule] phase=%d/%d iter=[%d,%d) entropy=%s action_std_target=%s action_std_current=%s action_std_prev=%s action_std_applied=%s action_std_rate_limit=%s",
+                phase_idx + 1,
+                len(phase_bounds) - 1,
+                seg_start,
+                seg_end,
+                f"{entropy_value:.4f}" if entropy_set and entropy_value is not None else "N/A",
+                f"{std_target_value:.4f}" if std_set and std_target_value is not None else "N/A",
+                f"{std_current_mean:.4f}" if std_set and std_current_mean is not None else "N/A",
+                f"{std_prev_mean:.4f}" if std_set and std_prev_mean is not None else "N/A",
+                f"{std_applied_mean:.4f}" if std_set and std_applied_mean is not None else "N/A",
+                "ON" if std_rate_limit_on else "OFF",
+            )
+
+        runner.learn(num_learning_iterations=seg_iters, init_at_random_ep_len=first_phase)
+        first_phase = False
+
+
+@hydra_task_config(args_cli.task, args_cli.agent)
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+    """Train with RSL-RL agent."""
+    debug_startup = bool(args_cli.debug_startup)
+    _configure_torch_runtime(bool(args_cli.perf_mode))
+    # override configurations with non-hydra CLI arguments
+    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    agent_cfg.max_iterations = (
+        args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
+    )
+    if args_cli.num_steps_per_env is not None:
+        if int(args_cli.num_steps_per_env) <= 0:
+            raise ValueError(f"--num_steps_per_env must be > 0, got {args_cli.num_steps_per_env}")
+        agent_cfg.num_steps_per_env = int(args_cli.num_steps_per_env)
+    if args_cli.num_mini_batches is not None:
+        if int(args_cli.num_mini_batches) <= 0:
+            raise ValueError(f"--num_mini_batches must be > 0, got {args_cli.num_mini_batches}")
+        agent_cfg.algorithm.num_mini_batches = int(args_cli.num_mini_batches)
+    if args_cli.num_learning_epochs is not None:
+        if int(args_cli.num_learning_epochs) <= 0:
+            raise ValueError(f"--num_learning_epochs must be > 0, got {args_cli.num_learning_epochs}")
+        agent_cfg.algorithm.num_learning_epochs = int(args_cli.num_learning_epochs)
+
+    # set the environment seed
+    # note: certain randomizations occur in the environment initialization so we set the seed here
+    env_cfg.seed = agent_cfg.seed
+    if env_cfg.seed is not None:
+        random.seed(int(env_cfg.seed))
+        np.random.seed(int(env_cfg.seed))
+        torch.manual_seed(int(env_cfg.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(env_cfg.seed))
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    # check for invalid combination of CPU device with distributed training
+    if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
+        raise ValueError(
+            "Distributed training is not supported when using CPU device. "
+            "Please use GPU device (e.g., --device cuda) for distributed training."
+        )
+
+    # multi-gpu training configuration
+    if args_cli.distributed:
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+        agent_cfg.device = f"cuda:{app_launcher.local_rank}"
+
+        # set seed to have diversity in different threads
+        seed = agent_cfg.seed + app_launcher.local_rank
+        env_cfg.seed = seed
+        agent_cfg.seed = seed
+        random.seed(int(seed))
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+    # specify directory for logging experiments
+    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+    log_root_path = os.path.abspath(log_root_path)
+    print(f"[INFO] Logging experiment in directory: {log_root_path}")
+    # specify directory for logging runs: {time-stamp}_{run_name}
+    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not change it (see PR #2346, comment-2819298849)
+    print(f"Exact experiment name requested from command line: {log_dir}")
+    if agent_cfg.run_name:
+        log_dir += f"_{agent_cfg.run_name}"
+    log_dir = os.path.join(log_root_path, log_dir)
+
+    # set the IO descriptors export flag if requested
+    if isinstance(env_cfg, ManagerBasedRLEnvCfg):
+        env_cfg.export_io_descriptors = args_cli.export_io_descriptors
+    else:
+        logger.warning(
+            "IO descriptors are only supported for manager based RL environments. No IO descriptors will be exported."
+        )
+
+    # set the log directory for the environment (works for all environment types)
+    env_cfg.log_dir = log_dir
+
+    # create isaac environment
+    if debug_startup:
+        print(
+            f"[DBG] Creating gym env at {datetime.now().isoformat()} with num_envs={env_cfg.scene.num_envs} on device={env_cfg.sim.device}",
+            flush=True,
+        )
+    _t_env = time.time()
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if debug_startup:
+        print(f"[DBG] gym env created in {time.time() - _t_env:.2f}s", flush=True)
+
+    # convert to single-agent instance if required by the RL algorithm
+    if isinstance(env.unwrapped, DirectMARLEnv):
+        env = multi_agent_to_single_agent(env)
+
+    # save resume path before creating a new log_dir
+    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+    # wrap for video recording
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print("[INFO] Recording videos during training.")
+        print_dict(video_kwargs, nesting=4)
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    start_time = time.time()
+
+    # wrap around environment for rsl-rl
+    if debug_startup:
+        print(f"[DBG] Wrapping env for rsl-rl at {datetime.now().isoformat()}", flush=True)
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    if debug_startup:
+        print(f"[DBG] Env wrapped at {datetime.now().isoformat()}", flush=True)
+
+    # warmup: helps pinpoint hangs (reset vs first step) and may trigger initial JIT/graph compilation
+    if debug_startup:
+        print(f"[DBG] Warmup: calling env.reset() at {datetime.now().isoformat()}", flush=True)
+        _t_reset = time.time()
+        _ = env.reset()
+        print(f"[DBG] Warmup: env.reset() done in {time.time() - _t_reset:.2f}s", flush=True)
+
+        try:
+            action_dim = int(getattr(env, "num_actions"))
+        except Exception:
+            action_dim = int(env.action_space.shape[0])
+        warmup_actions = torch.zeros((env.num_envs, action_dim), device=getattr(env, "device", agent_cfg.device))
+        print(
+            f"[DBG] Warmup: calling env.step() at {datetime.now().isoformat()} action_shape={tuple(warmup_actions.shape)}",
+            flush=True,
+        )
+        _t_step = time.time()
+        _ = env.step(warmup_actions)
+        print(f"[DBG] Warmup: env.step() done in {time.time() - _t_step:.2f}s", flush=True)
+
+    # create runner from rsl-rl
+    if debug_startup:
+        print(f"[DBG] Creating runner at {datetime.now().isoformat()} (runner={agent_cfg.class_name})", flush=True)
+    if agent_cfg.class_name == "OnPolicyRunner":
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "DistillationRunner":
+        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    else:
+        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    if debug_startup:
+        print(f"[DBG] Runner created at {datetime.now().isoformat()}", flush=True)
+    # write git state to logs
+    runner.add_git_repo_to_log(__file__)
+    # load the checkpoint
+    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        # load previously trained model
+        runner.load(resume_path)
+
+    # dump the configuration into log-directory
+    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+
+    # run training
+    if debug_startup:
+        print(
+            f"[DBG] Starting runner.learn at {datetime.now().isoformat()} max_iterations={agent_cfg.max_iterations}",
+            flush=True,
+        )
+    if agent_cfg.class_name == "OnPolicyRunner":
+        _learn_with_exploration_schedule(runner, agent_cfg, debug_startup=debug_startup)
+    else:
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+
+    print(f"Training time: {round(time.time() - start_time, 2)} seconds")
+
+    # close the simulator
+    env.close()
+
+
+if __name__ == "__main__":
+    # run the main function
+    main()
+    # close sim app
+    simulation_app.close()

@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual/env
+.venv/
+venv/
+.env
+
+# Isaac/RL runtime artifacts
+unitree_go2_phm/scripts/rsl_rl/logs/
+unitree_go2_phm/scripts/rsl_rl/outputs/
+unitree_go2_phm/scripts/rsl_rl/auto_reward_tuning/
+
+# Local real-run artifacts
+real_runs/
+go2_full_log.csv
+*.bag
+*.db3
+
+# OS/editor
+.DS_Store
+*.swp
+*.swo

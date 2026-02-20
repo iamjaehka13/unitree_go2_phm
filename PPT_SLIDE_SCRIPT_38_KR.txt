@@ -1,0 +1,288 @@
+Unitree Go2 PHM 발표 원고 (PPT 붙여넣기용)
+총 38장 (메인 22 + 백업 16)
+작성일: 2026-02-14
+
+사용 규칙:
+1) 각 슬라이드는 5~8줄로 구성.
+2) 그대로 복붙해서 발표 가능.
+3) 숫자/결과값은 실제 JSON 결과로 교체.
+
+====================================================================
+메인 덱 (22장)
+====================================================================
+
+[M01] 제목
+1) Unitree Go2에서 열/전압/기계 열화를 고려한 보행 제어를 다룹니다.
+2) 목표는 단순 성능 향상이 아니라, 열화 상태에서의 안전성과 강건성입니다.
+3) 오늘은 코드 구조, 실험 설계, sim-to-real 리스크를 순서대로 설명드리겠습니다.
+4) 마지막에 교수님과 확정해야 할 의사결정 항목 3개를 제안드리겠습니다.
+5) 발표 후에는 바로 논문용 표/그림 생산 모드로 전환할 계획입니다.
+
+[M02] 아젠다
+1) 문제 정의: 왜 기존 보행정책만으로는 부족한가.
+2) 방법: PHM 물리 + 정책 관측/보상 구조.
+3) 실험: 시나리오 평가와 replay governor 평가.
+4) 전이: teacher-student와 real-observable 경로.
+5) 리스크: sim-to-real에서 깨지는 지점과 대응.
+6) 결론: 2주 실행 계획과 오늘 의사결정 요청.
+
+[M03] 문제 정의
+1) 건강한 상태에서는 대부분 정책이 잘 걷습니다.
+2) 하지만 고온, 저전압, 마모가 겹치면 성능이 급격히 떨어집니다.
+3) 추종오차 증가와 안전여유 감소가 동시에 발생합니다.
+4) 논문 관점에서 중요한 질문은 “열화 상태에서 얼마나 버티는가”입니다.
+5) 그래서 PHM-aware locomotion을 메인 문제로 설정했습니다.
+
+[M04] 연구 질문
+1) 질문 1: PHM-aware 관측/보상이 robustness를 높이는가.
+2) 질문 2: 실측 가능한 채널만으로도 효과를 유지할 수 있는가.
+3) 질문 3: governor로 안전-성능 tradeoff를 개선할 수 있는가.
+4) 이 세 질문에 답하는 실험 구조를 코드에 구현했습니다.
+5) 결과는 시나리오 표 + replay 지표로 정량 보고합니다.
+
+[M05] 시스템 개요
+1) 정책이 액션을 생성하면 물리 루프에서 실제 토크가 적용됩니다.
+2) PHM 상태는 토크/속도 기반으로 매 스텝 갱신됩니다.
+3) 관측/보상/종료는 공통 PHM 상태를 읽습니다.
+4) 따라서 물리-학습-평가가 하나의 데이터 경로로 연결됩니다.
+5) 이 일관성이 리뷰 대응에서 가장 중요한 강점입니다.
+
+[M06] 코드 지도
+1) 학습: scripts/rsl_rl/train.py
+2) 시나리오 평가: scripts/rsl_rl/evaluate.py
+3) replay 평가: scripts/rsl_rl/evaluate_replay.py
+4) 환경 본체: unitree_go2_phm_env.py
+5) PHM 동역학: phm/interface.py, phm/models/*
+6) 실로봇 준비: scripts/real/*
+
+[M07] 태스크 3종
+1) Phm-v1: latent 포함 privileged 관측/보상.
+2) Baseline-v1: 같은 물리, PHM 관측/보상 제거.
+3) RealObs-v1: 실측 가능한 관측 중심.
+4) 이 분리를 통해 공정성 + 전이 가능성을 동시에 확보합니다.
+5) 메인 claim은 RealObs 결과 중심으로 구성합니다.
+
+[M08] 한 스텝 실행 순서
+1) 제어 스텝 시작 시 누적 메트릭을 초기화합니다.
+2) 액션 적용 후 substep 0에서 전압 예측과 brownout 갱신을 수행합니다.
+3) 같은 시점에 열화 게인/effort limit을 반영합니다.
+4) 물리 step 후 PHM 상태(온도/피로/전력)를 업데이트합니다.
+5) 마지막에 reward/termination/observation을 계산합니다.
+6) 이 순서로 stale action 기반 오차를 줄였습니다.
+
+[M09] PHM 상태 변수
+1) Thermal: coil_temp, motor_case_temp, temp_derivative, case_temp_derivative, thermal_status.
+2) Electrical: soc, battery_voltage, battery_voltage_true, min_voltage_log.
+3) Mechanical: fatigue_index, torque_saturation, stall_timer.
+4) Sim2Real 오염: encoder noise/offset, friction_bias, voltage_bias.
+5) 모든 모듈이 같은 phm_state를 읽어 일관성을 유지합니다.
+
+[M10] Thermal 모델
+1) 2-node RC 모델: coil <-> case <-> ambient.
+2) coil 열원은 copper 손실, case 열원은 inverter/friction/core/regen 미회수열입니다.
+3) case 냉각은 자연냉각 + 속도기반 강제대류 항을 사용합니다.
+4) RealObs의 case 온도 지표와 의미가 직접 연결됩니다.
+5) 임계 온도 기반 종료/패널티와 직접 연결됩니다.
+
+[M11] 전압/SOC 모델
+1) SOC에서 OCV를 계산하고, 부하 기반 sag를 반영합니다.
+2) 과도 sag 폭주를 막기 위해 limiter를 사용합니다.
+3) 회생 시 인위적 전압상승을 차단해 SOC/전압/brownout 정합을 유지합니다.
+4) replay governor 지표와도 직접 연동됩니다.
+5) 실로그 보정 대상 1순위는 이 축입니다.
+
+[M12] Mechanical degradation 모델
+1) 피로도는 토크 부하율, 속도, 진동, 열 스트레스로 누적됩니다.
+2) 고토크/고진동/고온에서 fatigue_rate가 증가합니다.
+3) stall 구간은 별도 타이머로 추적합니다.
+4) 누적 피로도는 제어권 감소와 수명 지표 계산에 사용됩니다.
+5) robustness 성능의 핵심 설명 변수입니다.
+
+[M13] 제어권 감소 경로
+1) fatigue와 temperature에 따라 Kp/Kd가 감소합니다.
+2) effort limit도 thermal/fatigue 조건으로 축소됩니다.
+3) 따라서 열화 상태는 정책에 실제 행동 제약으로 전달됩니다.
+4) fault injection은 여기에 외부 스케일을 추가하는 구조입니다.
+5) “건강상태가 실제 동작에 반영되는가”에 대한 코드 근거입니다.
+
+[M14] 관측 설계 원칙
+1) Privileged는 학습 상한 성능 확인용입니다.
+2) RealObs는 실측 가능한 채널 중심으로 구성합니다.
+3) latent 채널은 메인 실증 claim에서 분리합니다.
+4) 온도 semantics(coil/case)는 태스크별로 명확히 표기합니다.
+5) 논문 본문은 RealObs 지표 중심으로 작성합니다.
+
+[M15] 보상/종료 원칙
+1) 보상은 추종성능 + 효율 + 안전 여유를 동시에 반영합니다.
+2) 종료는 hard safety 경계를 명확히 정의합니다.
+3) PHM reward는 과도 포화/열폭주 방향을 억제하도록 설계했습니다.
+4) RealObs 보상은 case-proxy 기반으로 실측 채널에 맞췄습니다.
+5) 공정성은 Baseline 동일 물리 조건으로 확보합니다.
+
+[M16] 학습 프로토콜
+1) PHM 정책과 Baseline 정책을 같은 예산으로 학습합니다.
+2) 필요 시 seed 3회 이상 반복해 분산을 보고합니다.
+3) 체크포인트 선택 규칙은 사전에 고정합니다.
+4) reproducibility 설정은 train.py에 반영되어 있습니다.
+5) 목적은 “운 좋은 run”이 아니라 “재현 가능한 차이”입니다.
+
+[M17] 시나리오 평가
+1) fresh/used/aged/critical 시나리오를 강제 주입합니다.
+2) survival, tracking error, power/energy, temp, soh를 수집합니다.
+3) 결과는 eval json + meta json으로 저장됩니다.
+4) meta에는 온도 metric semantics가 포함됩니다.
+5) 메인 테이블은 이 결과에서 직접 생성합니다.
+
+[M18] Replay + Governor 평가
+1) 고정 command file로 입력을 통제합니다.
+2) governor ON/OFF와 fault ON/OFF를 비교합니다.
+3) trial step CSV와 summary JSON을 모두 저장합니다.
+4) 핵심 지표는 completed_rate, yaw_mae, temp/voltage margin입니다.
+5) 실용 안전성은 이 파트에서 가장 잘 드러납니다.
+
+[M19] Teacher-Student 전이
+1) teacher는 privileged 관측으로 전략을 학습합니다.
+2) student는 RealObs 관측으로 teacher 행동을 distill합니다.
+3) 이후 student를 RealObs PPO로 finetune합니다.
+4) 목적은 latent 의존을 줄인 실측 기반 정책 확보입니다.
+5) 메인 claim과 구현 난이도 사이의 균형점입니다.
+
+[M20] sim-to-real 리스크 요약
+1) 온도 채널 의미 mismatch(coil vs case).
+2) 500Hz->50Hz 집계 규칙 불일치.
+3) 제어 인터페이스 의미 차이(q_des+Kp/Kd).
+4) tau_est와 applied_torque 해석 차이.
+5) 배터리 동특성 불일치 및 stop reason 분류 누락.
+6) 이 6개를 통제해야 실기 해석이 안정됩니다.
+
+[M21] 실로그 반영 계획
+1) raw 500Hz 로그를 원본 그대로 보존합니다.
+2) 표준 스키마로 변환 후 50Hz 분석 뷰를 파생합니다.
+3) 임계값/필터를 실로그 분포 기반으로 보정합니다.
+4) 보정값을 관측/보상/종료/governor 파일에 반영합니다.
+5) 동일 replay 프로파일로 ON/OFF 재평가해 효과를 확인합니다.
+
+[M22] 결론과 의사결정 요청
+1) 현재 코드 구조는 물리-학습-평가 연결이 일관됩니다.
+2) 메인 논문 트랙은 RealObs + replay governor가 적합합니다.
+3) 오늘 확정이 필요한 항목은 3가지입니다.
+4) 투고 포지션, fault 범위, 실기 안전 임계값 승인 여부입니다.
+5) 확정되면 2주 내 표/그림 고정 단계까지 진행 가능합니다.
+
+
+====================================================================
+백업 덱 (16장)
+====================================================================
+
+[B01] 태스크 등록 코드 근거
+1) 세 태스크는 gym register로 명시적으로 연결됩니다.
+2) 각 태스크는 env cfg와 runner cfg가 분리되어 있습니다.
+3) 경로가 고정되어 있어 재현성 추적이 쉽습니다.
+4) 질문 시 __init__.py 등록부를 바로 보여줄 수 있습니다.
+5) 실험군/비교군 정의를 코드로 증명하는 슬라이드입니다.
+
+[B02] Env.step call graph 상세
+1) step 내부 처리 순서를 call graph로 시각화합니다.
+2) action 적용, brownout, degradation 적용 시점을 명확히 표시합니다.
+3) substep 0에서의 핵심 처리 이유를 설명합니다.
+4) reward/termination/reset 시점의 순서 의존성을 강조합니다.
+5) 동작 논리 일관성 질문 대응용입니다.
+
+[B03] reset/curriculum 로직
+1) reset 시 PHM 상태와 버퍼를 어떻게 초기화하는지 설명합니다.
+2) fatigue/temp/soc 초기 분포가 어떻게 주입되는지 보여줍니다.
+3) reset 직후 물리/관측 일관성 보정 루틴을 설명합니다.
+4) curriculum_total_steps 가변 설정과 normalized tracking gate를 명시합니다.
+5) 재현성/공정성 질문 대응용입니다.
+
+[B04] 관측 채널 비교표
+1) 태스크별 관측 채널 포함/제외를 표로 정리합니다.
+2) Baseline에서 PHM 관측이 제거된 점을 명확히 표시합니다.
+3) RealObs 채널은 실측 가능 축으로 묶어 제시합니다.
+4) 공정 비교와 전이 가능성의 근거를 동시에 제공합니다.
+5) 논문 claim 경계 설명에 사용합니다.
+
+[B05] 보상 항목 비교표
+1) locomotion 보상과 PHM 보상을 분리해 제시합니다.
+2) 태스크별 활성 보상 항목을 표시합니다.
+3) Baseline과 PHM의 차이는 보상 목적함수 차이임을 보여줍니다.
+4) RealObs 보상은 실측 온도 proxy 기준임을 명시합니다.
+5) “왜 이런 행동을 학습했는가” 질문 대응용입니다.
+
+[B06] 종료 조건 비교표
+1) fall, thermal runaway, motor stall, timeout 조건을 정리합니다.
+2) coil vs case proxy 종료 semantics를 분리해 표시합니다.
+3) 안전성 기준이 어떻게 정의됐는지 한눈에 보여줍니다.
+4) 실기 안전 프로토콜과 연결해 설명할 수 있습니다.
+5) 리뷰어 safety 지적 대응 근거 슬라이드입니다.
+
+[B07] 온도 semantics 상세
+1) coil hotspot과 case/housing의 물리적 차이를 명시합니다.
+2) 실측 채널은 case 계열이라는 점을 분명히 합니다.
+3) 태스크별 온도 metric 정의를 표로 고정합니다.
+4) 결과표 캡션에 넣을 표준 문구를 함께 제시합니다.
+5) 해석 혼선 방지 목적의 필수 백업 슬라이드입니다.
+
+[B08] Governor 수식 상세
+1) EMA, 예측, 스케일, 하드스톱 수식을 단계별로 보여줍니다.
+2) threshold와 tau 값의 의미를 함께 표시합니다.
+3) yaw 스케일을 더 강하게 줄이는 이유를 설명합니다.
+4) rate-limit을 둔 이유를 안정성 관점에서 설명합니다.
+5) 파라미터 튜닝 질문에 즉시 대응 가능합니다.
+
+[B09] Replay 명령 포맷
+1) YAML/CSV 입력 스키마를 명확히 보여줍니다.
+2) dt, segment, repeat, yaw_rate 의미를 정의합니다.
+3) command 통제 덕분에 비교 실험 공정성이 올라갑니다.
+4) 실험 재현을 위한 최소 입력 조건을 명시합니다.
+5) 재현성 질문 대응 슬라이드입니다.
+
+[B10] sim-to-real 리스크 상세표
+1) 리스크, 증상, 원인, 대응을 4열 표로 정리합니다.
+2) 각 리스크마다 코드 수정 파일을 같이 표기합니다.
+3) 우선순위는 온도 semantics와 집계 규칙 정렬입니다.
+4) stop reason 분해 로깅은 필수 항목으로 제시합니다.
+5) 실기 실패 원인 추적 속도를 높이는 슬라이드입니다.
+
+[B11] real 로그 처리 파이프라인
+1) 500Hz raw ingest -> schema normalize -> 50Hz derive 순서를 고정합니다.
+2) T_case_max, Vcell_min, Vpack 집계 규칙을 명시합니다.
+3) command/mode/estop 동기화 규칙을 같이 기록합니다.
+4) raw 보존 원칙을 명확히 해 감사 가능성을 확보합니다.
+5) 실험 운영 문서와 연결되는 백업 슬라이드입니다.
+
+[B12] 파일별 수정 포인트
+1) 관측 수정: phm_raw.py (voltage/thermal realobs 함수).
+2) 보상/종료 수정: rewards/phm.py, terminations/health.py.
+3) 설정 수정: unitree_go2_realobs_env_cfg.py.
+4) governor 수정: replay_utils.py + evaluate_replay.py.
+5) 평가 semantics 동기화: evaluate.py.
+6) 신규 real 브리지 파일 권장 경로까지 제시합니다.
+
+[B13] stop reason taxonomy
+1) stop reason을 temp/pack/cell/estop/mode-change로 분리합니다.
+2) 조기 종료 원인을 단일 label로 합치지 않습니다.
+3) summary에 원인별 count를 함께 저장합니다.
+4) 안전 개선이 실제 어떤 경로로 일어났는지 설명 가능합니다.
+5) 실기 신뢰성 보고에 매우 중요한 슬라이드입니다.
+
+[B14] ablation 우선순위
+1) 1순위: governor ON/OFF.
+2) 2순위: fault ON/OFF.
+3) 3순위: student scratch vs distilled.
+4) 4순위: observation ablation (시간 허용 시).
+5) 실험 예산 대비 정보량이 큰 순서로 제안합니다.
+
+[B15] 2주 상세 일정
+1) 주차별이 아니라 일자별 산출물 중심으로 제시합니다.
+2) Day1~2 학습, Day3~5 평가, Day6~7 정리로 구성합니다.
+3) 2주차는 보완실험 + 본문 고정 단계로 설정합니다.
+4) 의사결정 지연 시 어떤 일정이 밀리는지 표시합니다.
+5) 실행관리용 슬라이드로 사용합니다.
+
+[B16] FAQ/표준 답변
+1) baseline 공정성 질문의 표준 답변을 제시합니다.
+2) latent 사용 범위와 claim 경계를 문장으로 고정합니다.
+3) 실측 채널 중심 보고 원칙을 재확인합니다.
+4) threshold 보정 원칙과 근거를 짧게 제시합니다.
+5) 질의응답 마무리 슬라이드로 사용합니다.

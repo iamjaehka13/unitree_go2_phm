@@ -1,0 +1,158 @@
+# =============================================================================
+# unitree_go2_phm/unitree_go2_baseline_tuned_env_cfg.py
+# [Experiment] Tunable Baseline Configuration
+#
+# Purpose:
+# - Keep canonical baseline (`Unitree-Go2-Baseline-v1`) frozen for fair paper table.
+# - Provide a separate baseline variant (`Unitree-Go2-BaselineTuned-v1`) that allows
+#   reward auto-tuning experiments without contaminating the canonical baseline.
+# =============================================================================
+
+from __future__ import annotations
+from isaaclab.utils import configclass
+
+import isaaclab.envs.mdp as mdp
+from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import RewardTermCfg as RewTerm
+
+from . import mdp as phm_mdp
+from .unitree_go2_baseline_env_cfg import (
+    BaselineObservationsCfg,
+    BaselineTerminationsCfg,
+)
+from .unitree_go2_phm_env_cfg import (
+    UnitreeGo2PhmSceneCfg,
+    ActionsCfg,
+    EventCfg,
+    CommandsCfg,
+)
+from .unitree_go2_phm_env import UnitreeGo2PhmEnv
+
+
+@configclass
+class BaselineTunedRewardsCfg:
+    """Baseline rewards (initially same as canonical baseline; tunable by auto tuner)."""
+
+    track_lin_vel_xy = RewTerm(
+        func=phm_mdp.track_lin_vel_xy_exp,
+        weight=1.5,
+        params={"command_name": "base_velocity", "std": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+    )
+    track_ang_vel_z = RewTerm(
+        func=phm_mdp.track_ang_vel_z_exp,
+        weight=0.75,
+        params={"command_name": "base_velocity", "std": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+    )
+    feet_air_time = RewTerm(
+        func=phm_mdp.feet_air_time,
+        weight=0.1,
+        params={"command_name": "base_velocity", "threshold": 0.5},
+    )
+
+    feet_slide = RewTerm(
+        func=phm_mdp.feet_slide,
+        weight=-0.1,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+        },
+    )
+
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1.0,
+        params={
+            "threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_hip", ".*_thigh", ".*_calf"]),
+        },
+    )
+
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+    flat_orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-2.5, params={"asset_cfg": SceneEntityCfg("robot")})
+    joint_vel_l2 = RewTerm(func=mdp.joint_vel_l2, weight=-0.001)
+    joint_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-2e-4)
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.1)
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-10.0)
+
+
+@configclass
+class UnitreeGo2BaselineTunedEnvCfg(ManagerBasedRLEnvCfg):
+    class_type = UnitreeGo2PhmEnv
+    scene: UnitreeGo2PhmSceneCfg = UnitreeGo2PhmSceneCfg(num_envs=4096, env_spacing=2.5)
+
+    observations: BaselineObservationsCfg = BaselineObservationsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    events: EventCfg = EventCfg()
+    rewards: BaselineTunedRewardsCfg = BaselineTunedRewardsCfg()
+    terminations: BaselineTerminationsCfg = BaselineTerminationsCfg()
+    commands: CommandsCfg = CommandsCfg()
+
+    curriculum = None
+    curriculum_total_steps: int = 72_000
+    phm_curriculum_use_performance_gate: bool = False
+    phm_curriculum_steps_per_iter: int = 24
+    phm_curriculum_used_start_iter: int = 1601
+    phm_curriculum_used_end_iter: int = 1900
+    phm_curriculum_aged_end_iter: int = 2400
+    phm_curriculum_critical_end_iter: int = 2800
+    phm_curriculum_final_end_iter: int = 3000
+    voltage_sensor_bias_range_v: tuple[float, float] = (-0.12, 0.12)
+    encoder_pos_noise_std_rad: float = 0.005
+    encoder_vel_noise_std_rads: float = 0.03
+    friction_bias_range: tuple[float, float] = (0.95, 1.05)
+    imu_gyro_drift_sensitivity: float = 0.0008
+    imu_accel_drift_sensitivity: float = 0.0012
+    cmd_transport_dr_enable: bool = True
+    cmd_delay_max_steps: int = 1
+    cmd_dropout_prob: float = 0.005
+    encoder_sample_hold_prob: float = 0.01
+    case_temp_quant_step_c: float = 1.0
+    battery_voltage_quant_step_v: float = 0.01
+    cell_voltage_quant_step_v: float = 0.005
+    cell_ocv_bias_range_v: tuple[float, float] = (-0.015, 0.015)
+    cell_ir_range_ohm: tuple[float, float] = (0.0035, 0.0065)
+    cell_sensor_bias_range_v: tuple[float, float] = (-0.010, 0.010)
+    velocity_cmd_curriculum_enable: bool = True
+    velocity_cmd_curriculum_start_iter: int = 160
+    velocity_cmd_curriculum_ramp_iters: int = 340
+    velocity_cmd_curriculum_steps_per_iter: int = 24
+    velocity_cmd_target_lin_vel_x: tuple[float, float] = (-1.0, 1.0)
+    velocity_cmd_target_lin_vel_y: tuple[float, float] = (-0.4, 0.4)
+    velocity_cmd_target_ang_vel_z: tuple[float, float] = (-1.0, 1.0)
+    push_curriculum_enable: bool = True
+    push_curriculum_start_iter: int = 1001
+    push_curriculum_ramp_iters: int = 599
+    push_curriculum_steps_per_iter: int = 24
+    push_curriculum_initial_xy: tuple[float, float] = (0.0, 0.0)
+    push_curriculum_target_xy: tuple[float, float] = (-0.5, 0.5)
+    dr_curriculum_enable: bool = True
+    dr_curriculum_start_iter: int = 501
+    dr_curriculum_ramp_iters: int = 499
+    dr_curriculum_steps_per_iter: int = 24
+    dr_curriculum_initial_friction_range: tuple[float, float] = (0.6, 1.25)
+    dr_curriculum_target_friction_range: tuple[float, float] = (0.5, 1.3)
+    dr_curriculum_initial_mass_scale_range: tuple[float, float] = (0.9, 1.1)
+    dr_curriculum_target_mass_scale_range: tuple[float, float] = (0.8, 1.2)
+    dr_curriculum_initial_cmd_delay_max_steps: int = 1
+    dr_curriculum_target_cmd_delay_max_steps: int = 2
+
+    viewer: ViewerCfg = ViewerCfg(
+        eye=(3.0, 3.0, 3.0), lookat=(0.0, 0.0, 0.0), origin_type="env", env_index=0, asset_name="robot"
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.sim.dt = 0.005
+        self.decimation = 4
+        self.sim.render_interval = self.decimation
+        self.episode_length_s = 20.0
+        self.sim.physics_material = self.scene.terrain.physics_material
+        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+
+        if self.scene.contact_forces is not None:
+            self.scene.contact_forces.update_period = self.sim.dt
+        if self.scene.height_scanner is not None:
+            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
