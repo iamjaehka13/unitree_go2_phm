@@ -84,6 +84,41 @@ Bridge reference docs:
 
 ---
 
+## Direct Python Path (`unitree_sdk2_python`)
+
+If you prefer direct Python ingest on Jetson (e.g., Ubuntu 22.04), you can
+log `rt/lowstate` without ROS2/bridge:
+
+1) Install `unitree_sdk2_python` (or clone it and use `--sdk2py_root`).
+   - Required Python deps from upstream:
+     - `cyclonedds==0.10.2`
+     - `numpy`
+     - `opencv-python`
+2) Run:
+
+```bash
+python3 unitree_go2_phm/scripts/real/log_collector_sdk2py.py \
+  --interface enp3s0 \
+  --output_csv ./go2_full_log_sdk2py.csv \
+  --log_hz 500
+```
+
+If `unitree_sdk2py` is only cloned (not pip-installed), add:
+
+```bash
+  --sdk2py_root /path/to/unitree_sdk2_python
+```
+
+Then convert to replay CSV:
+
+```bash
+python3 unitree_go2_phm/scripts/real/log_to_replay_csv.py \
+  --input_csv ./go2_full_log_sdk2py.csv \
+  --output_csv ./go2_replay_50hz.csv
+```
+
+---
+
 ## Keep vs Remove (Go2-only)
 
 Keep (required):
