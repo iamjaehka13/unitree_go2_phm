@@ -1,0 +1,140 @@
+1) 내 판단: E는 “채택해도 되는 수준”으로 올라왔음
+
+너희 숫자 그대로 보면:
+
+Survival: A=100%, E=100% (동급)
+
+TrackErr: A 0.0306 / E 0.0307 (동급)
+
+PeakSat p95: A 66.677 → E 53.057 (tail 개선)
+
+PeakSat max: A 108.599 → E 70.903 (worst-case 개선)
+
+ModeSL%: A 79.0% → E 62.8% (stop_latch 점유 감소)
+
+ModeStand%: A 6.7% → E 22.3% (stand 전환 증가)
+
+LatchDur p95/max: 둘 다 19.94 / 19.96 (변화 없음)
+
+이건 결론이 명확해:
+
+E는 “안전성 tail 개선 + 성능 유지”를 동시에 달성했고, 바뀐 레버는 trigger 숫자가 아니라 ‘모드 정책’이었다.
+그래서 E를 default 후보로 승격시키는 게 맞아.
+
+논문/보고서 관점에서도 A는 “단순 governor”, E는 “mode-aware governor”로 스토리라인이 딱 서.
+
+2) 근데 왜 LatchDur은 그대로냐? (이건 “버그”라기보다 “설계/평가 조건” 이슈일 확률 큼)
+
+LatchDur p95/max가 거의 **에피소드 길이(≈20s)**로 붙는다는 건 대부분 에피소드에서:
+
+한 번 latch가 걸리면
+
+**끝까지 “unlatch 조건이 성립하지 않는다”**는 뜻이야.
+
+여기서 가장 흔한 원인은 두 가지 중 하나(또는 둘 다)야.
+
+(A) forced_walk 커맨드가 “영원히 high”라서 unlatch가 논리적으로 불가능
+
+E 세팅에 unlatch_require_low_cmd=True, unlatch_cmd_norm=0.20 들어갔지?
+
+그런데 forced_walk가 이전에 네가 썼던 것처럼 lin_x_min=0.3(혹은 그 근처)면,
+raw command norm이 0.20 아래로 내려갈 일이 없음.
+=> 그럼 unlatch는 수학적으로 불가능이고, LatchDur이 풀타임인 게 “정상 동작”이 돼.
+
+이건 너희가 지금 “safety_only + forced_walk”라는 상충되는 평가를 하고 있기 때문이야:
+
+safety_only는 “멈추거나 안전자세”
+
+forced_walk는 “계속 가라고 밀어붙임”
+
+governor가 제대로면, 이런 상황에서 풀타임 takeover가 나오는 게 오히려 맞는 그림이기도 해.
+
+(B) sat_recovery 조건 자체가 안 풀림(혹은 너무 빡셈)
+
+stand로 바꿔도 포화/비정상 신호가 계속 유지되면 sat_recovery가 못 풀고,
+결국 계속 latch 상태로 남음.
+
+3) 그래서 “다음 레버는 unlatch”가 맞긴 한데, 먼저 목표를 둘로 나눠야 함
+목표 1: “계속 강제 커맨드가 들어와도” 안전하게 버티기 (현재 평가 프로토콜)
+
+이 목표에서는 LatchDur이 길어도 OK야.
+
+대신 보는 지표는:
+
+PeakSat p95/max (너희가 이미 개선)
+
+ModeSL% (너희가 이미 감소)
+
+survival / tracking 유지
+
+즉, p7 결과만으로도 “E가 더 낫다”는 결론은 충분히 방어 가능해.
+
+목표 2: “상황이 안정되면” 다시 제어권 회복(unlatch/recover)
+
+이 목표는 forced_walk가 계속 high로 유지되는 평가에선 애초에 관측이 안 됨
+
+커맨드가 내려가는 구간이 있는 프로파일로 평가해야 의미가 생김.
+
+4) 내가 추천하는 다음 액션 (우선순위대로, 지금 코드 구조에 맞게)
+액션 A: “unlatch가 논리적으로 가능한지” 1분 체크
+
+meta에 아래 두 개만 같이 찍어서 확인해봐:
+
+eval_forced_walk_lin_x_min (또는 effective 커맨드 min/max)
+
+critical_governor_unlatch_cmd_norm_effective
+
+critical_governor_unlatch_require_low_cmd_effective
+
+만약 lin_x_min > unlatch_cmd_norm 이고 require_low_cmd=True면,
+지금 결과(LatchDur 풀타임)는 예상대로야. 튜닝해도 안 풀려.
+
+액션 B: “recover를 보여주고 싶다”면 평가 프로파일을 바꿔라 (가장 깔끔)
+
+새 cmd_profile 하나만 추가하면 됨:
+
+forced_walk_then_zero
+
+처음 5~8초: forced_walk
+
+이후: cmd_raw = 0 (혹은 작게)
+
+governor는 그 사이에 latch 걸리고, 0 구간에서 unlatch가 실제로 일어나야 함
+
+이러면 논문에서 “안전 takeover + 회복” 둘 다 보여줄 수 있어.
+
+액션 C: forced_walk에서조차 unlatch를 기대한다면(더 어려움)
+
+이건 설계 철학이 바뀌는 거라 옵션을 명확히 해야 해:
+
+옵션 C1 (현실적): “stop_latch 상태만 latch로 보고”, v_cap/stand는 latch로 안 본다
+
+즉 “takeover는 했지만 stop-latch는 줄었다”로 해석할 수 있음
+
+옵션 C2 (공격적): require_low_cmd를 raw가 아니라 eff 기준으로 바꾸거나 False로 둔다
+
+대신 **re-latch chatter 방지(cooldown, hysteresis)**가 필수
+
+나는 지금 단계에서는 **B(평가 프로파일에 command 내려가는 구간 추가)**가 제일 안전하고 논문 방어에도 깔끔하다고 봐.
+
+5) 결론: 지금 너희 판단(“E 채택 + 다음은 unlatch”) 나도 동의
+
+E는 채택해도 됨: tail(p95/max) 둘 다 내려갔고, tracking/survival 유지.
+
+LatchDur이 안 줄어든 건 “E가 실패”라기보다 평가 조건상 당연할 가능성이 큼.
+
+다음 단계는 “튜닝”이 아니라,
+
+unlatch가 가능한 상황을 만들고(프로파일)
+
+그 상황에서 unlatch 성능(time-to-unlatch, unlatch success)로 평가하는 게 맞음.
+
+원하면, 너희가 이미 mode/latched 계측을 다 넣어둔 상태니까,
+forced_walk_then_zero 프로파일에 맞춰서 paper에 바로 넣을 수 있는 recovery 지표 3개
+
+time_to_first_latch
+
+time_to_unlatch
+
+post_unlatch_peak_sat_p95
+이렇게까지 한 번에 설계해서 “실험 ID + 표 컬럼”까지 고정해줄게.

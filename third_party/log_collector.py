@@ -1,54 +1,75 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import time
+
 import rclpy
 from rclpy.node import Node
-import csv
-import time
-import os
+from rclpy.qos import qos_profile_sensor_data
 from unitree_go.msg import LowState
 
-CSV_FILE = "go2_full_log.csv"
 
-# =========================
 # Joint name mapping (12 DoF)
-# =========================
 JOINT_NAMES = [
-    "FR_hip", "FR_thigh", "FR_calf",   # Leg 0
-    "FL_hip", "FL_thigh", "FL_calf",   # Leg 1
-    "RR_hip", "RR_thigh", "RR_calf",   # Leg 2
-    "RL_hip", "RL_thigh", "RL_calf",   # Leg 3
+    "FR_hip",
+    "FR_thigh",
+    "FR_calf",
+    "FL_hip",
+    "FL_thigh",
+    "FL_calf",
+    "RR_hip",
+    "RR_thigh",
+    "RR_calf",
+    "RL_hip",
+    "RL_thigh",
+    "RL_calf",
 ]
 
 
 class LowStateLogger(Node):
-    def __init__(self):
-        super().__init__('lowstate_full_logger')
+    def __init__(
+        self,
+        output_csv: str,
+        topic: str,
+        log_hz: float,
+        flush_every_n: int,
+        print_every_s: float,
+    ):
+        super().__init__("lowstate_full_logger")
 
-        # 'w' 모드로 열어 실행할 때마다 새로 작성합니다. (이어서 쓰려면 'a'로 변경)
-        self.csv_file = open(CSV_FILE, 'w', newline='')
+        self.output_csv = output_csv
+        self.log_period_s = (1.0 / float(log_hz)) if float(log_hz) > 0.0 else 0.0
+        self.flush_every_n = max(int(flush_every_n), 1)
+        self.print_every_s = max(float(print_every_s), 0.2)
+
+        self.csv_file = open(self.output_csv, "w", newline="")
         self.writer = csv.writer(self.csv_file)
+        self._write_header()
 
-        # 헤더 작성
-        self.write_header()
-
-        # LowState 구독
+        # Use sensor-data QoS for high-rate robot telemetry.
         self.subscription = self.create_subscription(
             LowState,
-            '/lowstate',
+            topic,
             self.listener_callback,
-            10
+            qos_profile_sensor_data,
         )
 
-        self.start_time = time.time()
-        self.last_logged = 0.0
+        self.start_mono = time.monotonic()
+        self.last_logged_mono = 0.0
+        self.last_print_mono = self.start_mono
+        self.rows_logged = 0
+        self.callback_count = 0
+        self.gated_count = 0
 
         self.get_logger().info(
-            f"로깅 시작 | 저장 경로: {os.path.abspath(CSV_FILE)}"
+            f"로깅 시작 | topic={topic} | target_hz={log_hz:.1f} | "
+            f"저장 경로: {os.path.abspath(self.output_csv)}"
         )
 
-    # =========================
-    # CSV Header
-    # =========================
-    def write_header(self):
+    def _write_header(self):
         header = ["time_s"]
 
         # IMU
@@ -84,7 +105,6 @@ class LowStateLogger(Node):
             "bms_mcu_ntc2",
         ]
 
-        # BMS cell voltage (0~7 only)
         for i in range(8):
             header.append(f"bms_cell_vol_{i}")
 
@@ -92,14 +112,13 @@ class LowStateLogger(Node):
         header += ["foot_FL", "foot_FR", "foot_RL", "foot_RR"]
         header += ["foot_FL_est", "foot_FR_est", "foot_RL_est", "foot_RR_est"]
 
-        # Tick
         header.append("tick")
 
         # Wireless remote
         for i in range(40):
             header.append(f"wireless_remote_{i}")
 
-        # Other (fan_frequency 제거됨)
+        # Other
         header += [
             "bit_flag",
             "adc_reel",
@@ -109,109 +128,141 @@ class LowStateLogger(Node):
             "power_a",
         ]
 
-        # Reserve & CRC
         header += ["reserve", "crc"]
 
         self.writer.writerow(header)
         self.csv_file.flush()
 
-    # =========================
-    # Callback
-    # =========================
-    def listener_callback(self, msg: LowState):
-        now = time.time()
-
-        # 1초 주기 로깅
-        if now - self.last_logged < 1.0:
+    def _maybe_print_stats(self, msg: LowState, now_mono: float):
+        if (now_mono - self.last_print_mono) < self.print_every_s:
             return
+        elapsed = max(now_mono - self.start_mono, 1e-6)
+        log_hz = self.rows_logged / elapsed
+        cb_hz = self.callback_count / elapsed
+        self.get_logger().info(
+            f"[상태] rows={self.rows_logged} ({log_hz:.1f}Hz) | "
+            f"callbacks={self.callback_count} ({cb_hz:.1f}Hz) | "
+            f"gated={self.gated_count} | V={msg.power_v:.2f} | I={msg.power_a:.2f}"
+        )
+        self.last_print_mono = now_mono
 
-        self.last_logged = now
-        t = round(now - self.start_time, 2)
+    def listener_callback(self, msg: LowState):
+        now_mono = time.monotonic()
+        self.callback_count += 1
+
+        if self.log_period_s > 0.0 and (now_mono - self.last_logged_mono) < self.log_period_s:
+            self.gated_count += 1
+            return
+        self.last_logged_mono = now_mono
+        t = now_mono - self.start_mono
 
         try:
             row = [t]
 
             # IMU
-            row += [round(v, 4) for v in msg.imu_state.quaternion]
-            row += [round(v, 4) for v in msg.imu_state.gyroscope]
-            row += [round(v, 4) for v in msg.imu_state.accelerometer]
-            row += [round(v, 4) for v in msg.imu_state.rpy]
-            row.append(msg.imu_state.temperature)
+            row += [float(v) for v in msg.imu_state.quaternion]
+            row += [float(v) for v in msg.imu_state.gyroscope]
+            row += [float(v) for v in msg.imu_state.accelerometer]
+            row += [float(v) for v in msg.imu_state.rpy]
+            row.append(int(msg.imu_state.temperature))
 
             # MotorState (0~11 only)
             for m in msg.motor_state[:12]:
                 row += [
-                    m.mode,
-                    round(m.q, 4),
-                    round(m.dq, 4),
-                    round(m.ddq, 4),
-                    round(m.tau_est, 4),
-                    m.temperature,
-                    m.lost,
+                    int(m.mode),
+                    float(m.q),
+                    float(m.dq),
+                    float(m.ddq),
+                    float(m.tau_est),
+                    int(m.temperature),
+                    int(m.lost),
                 ]
 
             # BMS
             b = msg.bms_state
             row += [
-                b.version_high,
-                b.version_low,
-                b.status,
-                b.soc,
-                b.current,
-                b.cycle,
-                b.bq_ntc[0],
-                b.bq_ntc[1],
-                b.mcu_ntc[0],
-                b.mcu_ntc[1],
+                int(b.version_high),
+                int(b.version_low),
+                int(b.status),
+                int(b.soc),
+                int(b.current),
+                int(b.cycle),
+                int(b.bq_ntc[0]),
+                int(b.bq_ntc[1]),
+                int(b.mcu_ntc[0]),
+                int(b.mcu_ntc[1]),
             ]
-            row += [v for v in b.cell_vol[:8]]
+            row += [int(v) for v in b.cell_vol[:8]]
 
             # Foot force
-            row += [f for f in msg.foot_force]
-            row += [f for f in msg.foot_force_est]
+            row += [int(f) for f in msg.foot_force]
+            row += [int(f) for f in msg.foot_force_est]
 
-            # Tick
-            row.append(msg.tick)
+            row.append(int(msg.tick))
 
             # Wireless remote
             row += [int(w) for w in msg.wireless_remote]
 
             # Other
             row += [
-                msg.bit_flag,
-                msg.adc_reel,
-                msg.temperature_ntc1,
-                msg.temperature_ntc2,
-                round(msg.power_v, 2),
-                round(msg.power_a, 2),
+                int(msg.bit_flag),
+                float(msg.adc_reel),
+                int(msg.temperature_ntc1),
+                int(msg.temperature_ntc2),
+                float(msg.power_v),
+                float(msg.power_a),
             ]
 
-            # Reserve & CRC
-            row.append(msg.reserve)
-            row.append(msg.crc)
+            row.append(int(msg.reserve))
+            row.append(int(msg.crc))
 
             self.writer.writerow(row)
-            self.csv_file.flush()
+            self.rows_logged += 1
 
-            self.get_logger().info(
-                f"[저장] t={t}s | V={msg.power_v:.2f}V | I={msg.power_a:.2f}A"
-            )
+            if (self.rows_logged % self.flush_every_n) == 0:
+                self.csv_file.flush()
+
+            self._maybe_print_stats(msg, now_mono)
 
         except Exception as e:
             self.get_logger().error(f"CSV 기록 오류: {e}")
 
-    # =========================
-    # Shutdown
-    # =========================
     def destroy_node(self):
-        self.get_logger().info("CSV 파일 저장 후 노드 종료")
+        elapsed = max(time.monotonic() - self.start_mono, 1e-6)
+        self.csv_file.flush()
         self.csv_file.close()
+        self.get_logger().info(
+            f"CSV 저장 후 종료 | rows={self.rows_logged} | "
+            f"elapsed={elapsed:.2f}s | avg_log_hz={self.rows_logged/elapsed:.1f}"
+        )
         super().destroy_node()
 
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = LowStateLogger()
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Unitree Go2 LowState CSV logger (ROS2)")
+    parser.add_argument("--output_csv", type=str, default="go2_full_log.csv")
+    parser.add_argument("--topic", type=str, default="/lowstate")
+    parser.add_argument(
+        "--log_hz",
+        type=float,
+        default=500.0,
+        help="Target logging rate. Use 0 to log every callback.",
+    )
+    parser.add_argument("--flush_every_n", type=int, default=100)
+    parser.add_argument("--print_every_s", type=float, default=1.0)
+    return parser.parse_known_args()
+
+
+def main():
+    args, ros_args = _parse_args()
+    rclpy.init(args=ros_args)
+    node = LowStateLogger(
+        output_csv=args.output_csv,
+        topic=args.topic,
+        log_hz=float(args.log_hz),
+        flush_every_n=int(args.flush_every_n),
+        print_every_s=float(args.print_every_s),
+    )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -221,6 +272,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

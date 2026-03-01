@@ -24,6 +24,7 @@ Go2 사족보행 정책이 단일 모터 열화(single-motor fault)와 열/전�
 8. PPO 스케줄 축: entropy 0.01->0.005->0.003, action std cap-only + late limiter
 9. 사이드 실험 A(스트레스): all_motors_random 는 본문 메인 아님, 부록/한계 분석용
 10. 사이드 실험 B(추가 관측): Unitree-Go2-RealObsTempDose-v1 (thermal_rate + thermal_dose) ablation
+11. 온도 메트릭 의미 고정: RealObs-v1은 case_proxy(soft safety), TempDose는 coil_hotspot(90C hard-stop)
 
 
 3) 메인 주장과 금지 주장
@@ -63,7 +64,8 @@ Go2 사족보행 정책이 단일 모터 열화(single-motor fault)와 열/전�
    - fault 모델: single_motor_random at reset, 평가는 single_motor_fixed.
    - 커리큘럼: velocity -> DR -> push -> PHM.
    - 학습 안정화: entropy/action std 스케줄, boundary shock 완화.
-   - 안전 항: thermal/voltage 관련 보상/종료.
+   - 안전 항: thermal/voltage 관련 보상 + 모니터링(RealObs-v1 메인).
+   - hard thermal termination(90C coil)은 side task(TempDose)에서만 사용.
 
 4. Experiments
    - 비교군: baseline vs realobs-phm.
@@ -127,8 +129,9 @@ Go2 사족보행 정책이 단일 모터 열화(single-motor fault)와 열/전�
    - train.py with --task Unitree-Go2-RealObs-v1, --max_iterations 5000, seed 42/43/44
    - train.py with --task Unitree-Go2-Baseline-v1, --max_iterations 5000, seed 42/43/44
 
-2. 시나리오 평가
-   - evaluate.py --task <task> --checkpoint <model_4999.pt> --num_envs 512 --num_episodes 300
+2. 시나리오 평가 (메인 프로토콜)
+   - evaluate.py --task <task> --checkpoint <model_4999.pt> --num_envs 512 --num_episodes 300 --eval_fault_mode single_motor_fixed --eval_fault_motor_id <0..11>
+   - exploratory run이 아니면 --no-paper-protocol-strict 사용 금지
 
 3. 재현 영상
    - play.py with fresh/critical 각각

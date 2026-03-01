@@ -19,8 +19,8 @@ class UnitreeGo2PhmPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """
     # Literature-aligned PPO defaults (2109.11978 + legged_gym convention).
     num_steps_per_env = 24
-    # 3000 iters to cover staged walk->disturbance->PHM degradation curriculum.
-    max_iterations = 3000
+    # 5000 iters: 3000까지 ramp + 3001~5000 hold 안정화.
+    max_iterations = 5000
     save_interval = 50
     experiment_name = "unitree_go2_phm_strategic"
     # Staged exploration schedule (iteration index is absolute learning iteration):

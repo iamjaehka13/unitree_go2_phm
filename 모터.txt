@@ -1,0 +1,119 @@
+Unitree Go2 PHM 프로젝트: 모터(전기) 모델링 구조 설명 (PD -> Torque -> Current/Voltage?)
+================================================================================
+
+질문 요지
+---------
+“모터 모델링을 구현했다고 했는데, 기존 PD 제어로 요구 토크를 계산한 뒤,
+그 토크를 전류/전압(배터리 sag)으로 연결하는 구조로 설계한 거냐?”
+
+결론(TL;DR)
+-----------
+1) 메인(물리) 경로는 "정책이 토크를 직접 만들고 전류/전압으로 가는 구조"가 아니라,
+   "정책은 관절 위치 타겟을 주고, PhysX/IsaacLab의 Implicit PD가 토크를 생성"합니다.
+   그리고 우리는 그 결과로 물리엔진이 실제로 적용한 토크(applied_torque)를 읽어
+   전류/전력/전압 sag(SOC 기반)으로 연결해 PHM 상태를 업데이트합니다.
+
+2) 다만, brownout(저전압 제한) 같은 BMS-관점 전압 예측은 물리 시뮬레이션 전(substep 0)에
+   applied_torque를 알 수 없으므로, PD 공식으로 “요구 토크”를 추정해서 전압을 예측합니다.
+   (이 예측 전압으로 effort limit을 스케일링하는 로직이 있음)
+
+전체 구조(그림)
+---------------
+[정책/액션] -> (joint position target) -> [PhysX Implicit PD] -> applied_torque
+     -> [PHM 업데이트: 전류/손실/전력/에너지/SOC/전압] -> (온도/피로 등 PHM state)
+     -> [열화 주입: Kp/Kd/effort limit 감소 + brownout 스케일] -> 다시 PhysX
+
+별도(BMS 예측) 가지:
+(joint position target + noisy state) -> [PD로 요구토크 추정] -> [전압 예측]
+     -> [brownout latch/hysteresis] -> effort limit 스케일(토크 한계 감소)
+
+세부: 제어 루프 vs 물리(substep) 루프
+------------------------------------
+이 환경은 control step 내부에서 decimation(여러 substep)을 돌립니다.
+핵심은 "substep마다 실제 applied_torque가 나온 뒤 PHM을 적분한다"는 점입니다.
+
+- Control step 시작(substep 0):
+  1) action을 적용해서 joint_pos_target을 최신으로 만듭니다.
+  2) (BMS 관점) PD 기반 전압 예측 -> brownout 스케일 결정
+  3) (Physics 관점) PHM 상태(온도/피로)를 기반으로 Kp/Kd/effort limits를 계산해
+     시뮬레이터에 주입합니다.
+
+- 이후 각 physics substep:
+  4) sim.step() 후, PhysX가 실제로 적용한 토크/속도를 읽어 PHM(전기/열/배터리)을 적분합니다.
+  5) substep 동안 최저 전압(min voltage)을 추적합니다.
+
+“PD로 요구 토크를 계산하냐?”에 대한 정확한 답
+----------------------------------------------
+A. 메인(ground truth) 경로: PD 토크를 우리가 직접 계산하지 않습니다.
+   - 액션은 관절 위치 타겟입니다.
+   - actuator는 IsaacLab의 ImplicitActuator 기반이며, PhysX가 내부적으로 PD 토크를 생성합니다.
+   - 우리는 결과로 나온 applied_torque를 읽어 전기 모델을 업데이트합니다.
+
+B. 예측(BMS/brownout) 경로: PD로 요구 토크를 계산합니다.
+   - 물리 step 이전에는 applied_torque를 모릅니다.
+   - 그래서 target_pos - current_pos, joint_vel로 PD 토크를 추정해 전압을 예측합니다.
+   - 이 예측 전압이 brownout 스케일(=토크 한계 감소)로 이어집니다.
+
+전기 모델(토크 -> 전류/전압)에서 우리가 실제로 하는 것
+--------------------------------------------------------
+1) 입력(물리 결과):
+   - applied_torque: PhysX가 실제로 적용한 토크
+   - joint_vel: 관절 속도
+
+2) 전류 추정(간략 모델):
+   - I_est ≈ |tau| / (K_t * gear_ratio)
+   - 여기서 K_t(토크 상수), 기어비를 사용합니다.
+
+3) 손실/전력:
+   - Copper loss: I^2 * R(T) (권선 저항은 온도에 따라 증가)
+   - Inverter loss: MOSFET R + Vdrop 기반의 간략 손실
+   - Mechanical(core + friction): 코어 손실(속도 의존) + 마찰 파워(별도 계산/주입)
+   - 회생(재생) 효율은 속도 기반 가우시안 효율곡선으로 반영합니다.
+
+4) SOC/전압:
+   - (joint별 power 합) -> 에너지 적분 -> SOC 감소(회생으로 SOC 증가시키는 건 차단)
+   - pack 전압은 OCV(SOC) - I*R 형태의 sag(급락 limiter 포함)으로 계산합니다.
+   - true_voltage와 sensor-biased voltage를 분리 저장하고, 선택적으로 cell voltage도 만듭니다.
+
+우리가 “안 하는 것”(질문자가 기대할 수 있는 더 상세 모델과의 차이)
+---------------------------------------------------------------
+- 모터 드라이버 전류 루프, PWM, back-EMF(V = IR + Ke*w), 전기 동역학(인덕턴스) 같은
+  상세한 전기-기계 연성 모델을 PhysX actuator에 직접 붙여서 토크를 만드는 방식은 아닙니다.
+- 대신 “토크 결과를 기반으로 전류/손실/배터리 sag를 계산”하는 PHM 레벨 모델입니다.
+
+상대에게 보내기 좋은 답변(붙여넣기용)
+-----------------------------------
+우리 프로젝트는 정책이 토크를 직접 출력해서 전류/전압으로 연결하는 구조가 아니라,
+정책은 관절 위치 타겟(joint_pos_target)을 주고 PhysX/IsaacLab의 Implicit PD가 실제 토크를 만듭니다.
+그 다음 물리엔진이 실제로 적용한 토크(applied_torque)와 관절 속도(joint_vel)를 읽어서
+I ≈ |tau|/(Kt*gear)로 전류를 추정하고, I^2R(T)+인버터+마찰/코어손실+기계일을 합쳐 부하전력을 만든 뒤,
+SOC 적분과 OCV-IR sag로 배터리 전압을 계산해 PHM 상태(온도/피로/전압/브라운아웃)를 업데이트합니다.
+다만 brownout 전압 예측은 물리 step 전에 applied_torque를 모르기 때문에 PD로 요구토크를 추정해
+예측 전압을 만들고, 그걸로 토크 한계(effort limit)를 스케일링합니다.
+
+코드 근거(파일/라인)
+-------------------
+1) 액션은 관절 위치 타겟:
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/unitree_go2_phm_env_cfg.py:180`
+
+2) Implicit actuator(PD는 PhysX가 수행) + PHM actuator 래퍼:
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/unitree_go2_phm_env_cfg.py:110`
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/mdp/actuators.py:12`
+
+3) 열화 주입(Kp/Kd/effort limit/brownout) 및 control-step 루프:
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/unitree_go2_phm_env.py:885`
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/unitree_go2_phm_env.py:983`
+
+4) BMS 관점 전압 예측(요구토크를 PD로 추정하는 부분):
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/unitree_go2_phm_env.py:1210`
+
+5) PHM 전기/열/배터리 적분(실제 applied_torque 기반):
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/phm/interface.py:223`
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/phm/interface.py:242`
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/phm/interface.py:386`
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/phm/interface.py:482`
+
+6) 배터리 전압 sag / 손실 모델 유틸:
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/phm/utils.py:70`
+- `unitree_go2_phm/source/unitree_go2_phm/unitree_go2_phm/tasks/manager_based/unitree_go2_phm/phm/utils.py:109`
+

@@ -20,6 +20,12 @@ parser = argparse.ArgumentParser(description="Play a trained RL agent with RSL-R
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during playback.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--video_flat_folder",
+    type=str,
+    default="",
+    help="If set, save all video files into this single folder instead of per-tag subfolders.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -93,6 +99,48 @@ parser.add_argument(
     type=float,
     default=10.0,
     help="Command resampling period used when --force_walk_command is enabled.",
+)
+parser.add_argument(
+    "--follow_camera",
+    action="store_true",
+    default=False,
+    help="Continuously track env_0 robot root with a follower camera during playback/video.",
+)
+parser.add_argument(
+    "--follow_cam_offset_x",
+    type=float,
+    default=-2.2,
+    help="Follower camera local offset X (m) in robot base frame.",
+)
+parser.add_argument(
+    "--follow_cam_offset_y",
+    type=float,
+    default=0.0,
+    help="Follower camera local offset Y (m) in robot base frame.",
+)
+parser.add_argument(
+    "--follow_cam_offset_z",
+    type=float,
+    default=1.1,
+    help="Follower camera local offset Z (m) in robot base frame.",
+)
+parser.add_argument(
+    "--follow_cam_lookat_z",
+    type=float,
+    default=0.35,
+    help="Follower camera look-at height offset above robot root (m).",
+)
+parser.add_argument(
+    "--follow_cam_use_yaw_only",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use only robot yaw for follower offset rotation (reduces pitch/roll camera jitter).",
+)
+parser.add_argument(
+    "--follow_cam_smooth_alpha",
+    type=float,
+    default=1.0,
+    help="EMA smoothing alpha for follower camera in (0,1]. Lower is smoother.",
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
@@ -421,10 +469,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap for video recording
     if args_cli.video:
+        # Tag playback videos with forced PHM settings for easy later comparison.
+        scenario_tag = force_scenario if force_scenario != "none" else "from_env"
+        motor_tag = (
+            f"m{int(args_cli.force_fault_motor_id)}"
+            if 0 <= int(args_cli.force_fault_motor_id) < 12
+            else "mrand"
+        )
+        ckpt_name = os.path.splitext(os.path.basename(resume_path))[0]
+        ckpt_tag = ckpt_name if ckpt_name else "ckpt"
+
+        def _num_tag(x: float) -> str:
+            sign = "p" if float(x) >= 0.0 else "n"
+            mag = abs(float(x))
+            return f"{sign}{mag:.2f}".replace(".", "p")
+
+        if bool(args_cli.force_walk_command):
+            cmd_tag = (
+                f"vx{_num_tag(args_cli.play_cmd_lin_x)}_"
+                f"vy{_num_tag(args_cli.play_cmd_lin_y)}_"
+                f"wz{_num_tag(args_cli.play_cmd_ang_z)}"
+            )
+        else:
+            cmd_tag = "cmd_auto"
+
+        video_tag = f"{scenario_tag}_{motor_tag}_{cmd_tag}_{ckpt_tag}"
+        flat_folder = str(args_cli.video_flat_folder).strip()
+        if flat_folder != "":
+            video_folder = os.path.abspath(flat_folder)
+        else:
+            video_folder = os.path.join(log_dir, "videos", "play", video_tag)
+        os.makedirs(video_folder, exist_ok=True)
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
+            "video_folder": video_folder,
             "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
+            "name_prefix": f"play_{video_tag}",
             "disable_logger": True,
         }
         print("[INFO] Recording videos during playback.")
@@ -477,6 +557,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = _obs_from_reset_output(env.reset())
     timestep = 0
+
+    follow_camera_enabled = bool(args_cli.follow_camera) and hasattr(base_env, "robot")
+    follow_cam_offset = torch.tensor(
+        [[float(args_cli.follow_cam_offset_x), float(args_cli.follow_cam_offset_y), float(args_cli.follow_cam_offset_z)]],
+        device=base_env.device,
+        dtype=torch.float32,
+    )
+    follow_cam_lookat_z = float(args_cli.follow_cam_lookat_z)
+    follow_cam_use_yaw_only = bool(args_cli.follow_cam_use_yaw_only)
+    follow_cam_smooth_alpha = float(max(1e-3, min(1.0, args_cli.follow_cam_smooth_alpha)))
+    follow_cam_eye_prev: torch.Tensor | None = None
+    follow_cam_target_prev: torch.Tensor | None = None
+    if bool(args_cli.follow_camera) and not hasattr(base_env.sim, "set_camera_view"):
+        print("[WARNING] --follow_camera requested but sim.set_camera_view is unavailable; fallback to static camera.")
+        follow_camera_enabled = False
 
     overload_markers: VisualizationMarkers | None = None
     overload_offsets: torch.Tensor | None = None
@@ -570,6 +665,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # reset recurrent states for episodes that have terminated
         _safe_reset_recurrent(policy_nn, dones)
         timestep += 1
+
+        if follow_camera_enabled:
+            root_pos = base_env.robot.data.root_pos_w[0:1]
+            root_quat = base_env.robot.data.root_quat_w[0:1]
+            if follow_cam_use_yaw_only:
+                # Rotate offset by base yaw only to avoid roll/pitch-induced camera shake.
+                w = root_quat[:, 0]
+                x = root_quat[:, 1]
+                y = root_quat[:, 2]
+                z = root_quat[:, 3]
+                yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+                cy = torch.cos(yaw)
+                sy = torch.sin(yaw)
+                ox = follow_cam_offset[:, 0]
+                oy = follow_cam_offset[:, 1]
+                oz = follow_cam_offset[:, 2]
+                wx = cy * ox - sy * oy
+                wy = sy * ox + cy * oy
+                cam_eye_des = root_pos + torch.stack((wx, wy, oz), dim=-1)
+            else:
+                cam_eye_des = root_pos + quat_apply(root_quat, follow_cam_offset)
+            cam_target_des = root_pos.clone()
+            cam_target_des[:, 2] += follow_cam_lookat_z
+
+            if follow_cam_smooth_alpha < 0.999:
+                if follow_cam_eye_prev is None:
+                    follow_cam_eye_prev = cam_eye_des.clone()
+                    follow_cam_target_prev = cam_target_des.clone()
+                cam_eye = follow_cam_smooth_alpha * cam_eye_des + (1.0 - follow_cam_smooth_alpha) * follow_cam_eye_prev
+                cam_target = (
+                    follow_cam_smooth_alpha * cam_target_des + (1.0 - follow_cam_smooth_alpha) * follow_cam_target_prev
+                )
+                follow_cam_eye_prev = cam_eye
+                follow_cam_target_prev = cam_target
+            else:
+                cam_eye = cam_eye_des
+                cam_target = cam_target_des
+            base_env.sim.set_camera_view(
+                eye=cam_eye[0].detach().cpu().tolist(),
+                target=cam_target[0].detach().cpu().tolist(),
+            )
 
         if overload_markers is not None and overload_offsets is not None:
             phm = base_env.phm_state

@@ -371,6 +371,8 @@ def main() -> int:
             str(int(args.seed)),
             "--output_dir",
             str(eval_out),
+            # Auto-tuning explores reward settings; do not enforce paper fixed-fault protocol here.
+            "--no-paper-protocol-strict",
         ]
         if str(args.device).strip() != "":
             eval_cmd += ["--device", str(args.device)]

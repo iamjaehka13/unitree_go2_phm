@@ -8,7 +8,7 @@ class UnitreeGo2RealObsPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # Literature-aligned PPO defaults (2109.11978 + legged_gym convention).
     num_steps_per_env = 24
-    max_iterations = 3000
+    max_iterations = 5000
     save_interval = 50
     experiment_name = "unitree_go2_realobs"
     num_observation_history = 5

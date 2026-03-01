@@ -34,6 +34,37 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--train_fault_mode",
+    type=str,
+    default="default",
+    choices=["default", "single_motor_random", "single_motor_fixed", "all_motors_random"],
+    help="Override PHM fault injection mode for training. 'default' keeps task config as-is.",
+)
+parser.add_argument(
+    "--train_fault_motor_id",
+    type=int,
+    default=-1,
+    help=(
+        "If set to [0..11], force single_motor_fixed training at this motor index "
+        "(overrides --train_fault_mode)."
+    ),
+)
+parser.add_argument(
+    "--train_fault_pair_uniform",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help=(
+        "Override mirror-pair-uniform sampling for single_motor_random mode. "
+        "Use --train-fault-pair-uniform/--no-train-fault-pair-uniform."
+    ),
+)
+parser.add_argument(
+    "--train_fault_hold_steps",
+    type=int,
+    default=None,
+    help="Override fault motor hold window (env steps) for single_motor_random mode.",
+)
+parser.add_argument(
     "--num_steps_per_env",
     type=int,
     default=None,
@@ -461,6 +492,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(env_cfg.seed))
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    train_fault_mode = str(args_cli.train_fault_mode).strip().lower()
+    train_fault_motor_id = int(args_cli.train_fault_motor_id)
+    if train_fault_mode == "single_motor_fixed" and train_fault_motor_id < 0:
+        raise ValueError(
+            "--train_fault_mode=single_motor_fixed requires --train_fault_motor_id in [0..11]. "
+            "Refusing silent fallback to random fault mode."
+        )
+    if train_fault_motor_id >= 0 and not (0 <= train_fault_motor_id < 12):
+        raise ValueError(
+            f"Invalid --train_fault_motor_id={train_fault_motor_id} (expected 0..11)."
+        )
+
+    if train_fault_motor_id >= 0:
+        setattr(env_cfg, "phm_fault_injection_mode", "single_motor_fixed")
+        setattr(env_cfg, "phm_fault_fixed_motor_id", train_fault_motor_id)
+        logger.info("[Train] Overriding fixed fault motor: id=%d (single_motor_fixed)", train_fault_motor_id)
+    elif train_fault_mode != "default":
+        setattr(env_cfg, "phm_fault_injection_mode", train_fault_mode)
+        logger.info("[Train] Overriding phm_fault_injection_mode=%s", train_fault_mode)
+    if args_cli.train_fault_pair_uniform is not None:
+        setattr(env_cfg, "phm_fault_pair_uniform_enable", bool(args_cli.train_fault_pair_uniform))
+        logger.info(
+            "[Train] Overriding phm_fault_pair_uniform_enable=%s",
+            bool(args_cli.train_fault_pair_uniform),
+        )
+    if args_cli.train_fault_hold_steps is not None:
+        if int(args_cli.train_fault_hold_steps) < 0:
+            raise ValueError(
+                f"Invalid --train_fault_hold_steps={args_cli.train_fault_hold_steps} (expected >= 0)."
+            )
+        setattr(env_cfg, "phm_fault_hold_steps", int(args_cli.train_fault_hold_steps))
+        logger.info("[Train] Overriding phm_fault_hold_steps=%d", int(args_cli.train_fault_hold_steps))
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
         raise ValueError(
