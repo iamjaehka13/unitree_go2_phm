@@ -560,7 +560,7 @@ class UnitreeGo2PhmEnvCfg(ManagerBasedRLEnvCfg):
     cell_ir_range_ohm: tuple[float, float] = (0.0035, 0.0065)
     cell_sensor_bias_range_v: tuple[float, float] = (-0.010, 0.010)
     # Curriculum schedule length in environment steps (used by PHM reset curriculum).
-    curriculum_total_steps: int = 72_000
+    curriculum_total_steps: int = 120_000
     # PHM degradation curriculum milestones (iteration-based).
     # Requested 3000-iter plan:
     # - 0~1600 : locomotion/DR focus (PHM almost fresh)
@@ -579,6 +579,31 @@ class UnitreeGo2PhmEnvCfg(ManagerBasedRLEnvCfg):
     # - "all_motors_random"   (legacy hardest mode)
     phm_fault_injection_mode: str = "single_motor_random"
     phm_fault_fixed_motor_id: int = -1
+    # For single_motor_random: sample mirror pairs uniformly then side 50:50.
+    phm_fault_pair_uniform_enable: bool = True
+    # For single_motor_random: keep sampled fault motor for this many env steps.
+    # This equalizes per-motor training step exposure across resets.
+    phm_fault_hold_steps: int = 1000
+    # Critical command governor (command_manager.compute 직후 적용).
+    phm_scenario_id_critical: int = 4
+    critical_governor_enable: bool = True
+    critical_governor_v_cap_norm: float = 0.15
+    critical_governor_wz_cap: float = 0.0
+    critical_governor_ramp_tau_s: float = 2.0
+    critical_governor_p_stand_high: float = 0.25
+    critical_governor_stand_trigger_norm: float = 0.20
+    critical_governor_latch_hold_steps: int = 100
+    critical_governor_unlatch_stable_steps: int = 50
+    critical_governor_unlatch_cmd_norm: float = 0.10
+    critical_governor_unlatch_require_low_cmd: bool = True
+    critical_governor_unlatch_require_sat_recovery: bool = False
+    critical_governor_pose_roll_pitch_max_rad: float = 0.25
+    critical_governor_pose_height_margin_m: float = 0.05
+    critical_governor_sat_thr: float = 0.99
+    critical_governor_sat_window_steps: int = 15
+    critical_governor_sat_trigger: float = 0.95
+    critical_governor_sat_trigger_hi: float = 0.95
+    critical_governor_sat_trigger_lo: float = 0.95
     # Velocity-command curriculum:
     # - keep easy standing/near-zero velocity phase in early training
     # - widen command ranges from `start_iter` onward.

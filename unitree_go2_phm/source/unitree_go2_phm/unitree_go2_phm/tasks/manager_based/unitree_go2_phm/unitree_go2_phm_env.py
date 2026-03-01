@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import time
 import logging
@@ -25,10 +26,12 @@ from .phm.interface import (
     refresh_phm_sensors,
     clear_step_metrics,
 )
+from .phm.sat_latch import SatLatchCfg, SatRatioLatch
 
 # [PHM Constants]
 from .phm.constants import (
     T_AMB,
+    BASE_HEIGHT_MIN,
     TEMP_WARN_THRESHOLD, 
     TEMP_CRITICAL_THRESHOLD,
     B_VISCOUS,
@@ -188,6 +191,14 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
         self._init_velocity_command_curriculum(cfg)
         self._init_push_curriculum(cfg)
         self._init_dr_curriculum(cfg)
+        self.enable_eval_gait_metrics = bool(getattr(cfg, "enable_eval_gait_metrics", False))
+        self._eval_gait_contact_force_threshold = float(getattr(cfg, "eval_contact_force_threshold", 15.0))
+        self._eval_nonzero_cmd_threshold = float(getattr(cfg, "eval_nonzero_cmd_threshold", 0.05))
+        self._eval_stand_cmd_threshold = float(getattr(cfg, "eval_stand_cmd_threshold", 0.01))
+        self._eval_gait_foot_body_names = getattr(cfg, "eval_foot_body_names", None)
+        self._init_eval_gait_metric_buffers()
+        self._init_critical_command_governor(cfg)
+        self._validate_base_command_write_through_once()
 
     def clear_external_fault_profile(self):
         """Reset external actuator fault multipliers to nominal (1.0)."""
@@ -232,6 +243,704 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
             print(f"[DBG] Env.reset done in {time.time() - t0:.2f}s", flush=True)
             self._dbg_first_reset = False
         return out
+
+    def configure_eval_gait_metrics(
+        self,
+        enabled: bool | None = None,
+        foot_body_names: Sequence[str] | None = None,
+        contact_force_threshold: float | None = None,
+        nonzero_cmd_threshold: float | None = None,
+        stand_cmd_threshold: float | None = None,
+    ) -> None:
+        """Runtime configuration hook for evaluation-only gait diagnostics."""
+        if enabled is not None:
+            self.enable_eval_gait_metrics = bool(enabled)
+        if foot_body_names is not None:
+            self._eval_gait_foot_body_names = list(foot_body_names)
+        if contact_force_threshold is not None:
+            self._eval_gait_contact_force_threshold = float(contact_force_threshold)
+        if nonzero_cmd_threshold is not None:
+            self._eval_nonzero_cmd_threshold = float(nonzero_cmd_threshold)
+        if stand_cmd_threshold is not None:
+            self._eval_stand_cmd_threshold = float(stand_cmd_threshold)
+        self._init_eval_gait_metric_buffers()
+
+    def _get_eval_contact_sensor(self):
+        if "contact_forces" in self.scene.sensors:
+            return self.scene["contact_forces"]
+        return None
+
+    def _get_robot_body_names(self) -> list[str]:
+        data = self.robot.data
+        for key in ("body_names", "_body_names", "link_names", "_link_names"):
+            names = getattr(data, key, None)
+            if names is not None:
+                try:
+                    return list(names)
+                except Exception:
+                    pass
+        return []
+
+    def _resolve_eval_foot_body_names(self) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+        sensor = self._get_eval_contact_sensor()
+        if sensor is None or not hasattr(sensor, "body_names"):
+            return [], torch.empty(0, dtype=torch.long, device=self.device), torch.empty(0, dtype=torch.long, device=self.device)
+
+        sensor_body_names = list(sensor.body_names)
+        robot_body_names = self._get_robot_body_names()
+
+        requested = self._eval_gait_foot_body_names
+        if requested is None:
+            resolved_names = [n for n in sensor_body_names if ("foot" in n.lower() or "toe" in n.lower())]
+            resolved_names = resolved_names[:4]
+        else:
+            resolved_names = []
+            for name in list(requested):
+                if name in sensor_body_names:
+                    resolved_names.append(name)
+                else:
+                    low = str(name).lower()
+                    matches = [bn for bn in sensor_body_names if low in bn.lower()]
+                    if len(matches) == 1:
+                        resolved_names.append(matches[0])
+            resolved_names = resolved_names[:4]
+
+        if len(resolved_names) < 4:
+            return [], torch.empty(0, dtype=torch.long, device=self.device), torch.empty(0, dtype=torch.long, device=self.device)
+
+        sensor_ids = [sensor_body_names.index(n) for n in resolved_names]
+        robot_ids = []
+        for n in resolved_names:
+            if n in robot_body_names:
+                robot_ids.append(robot_body_names.index(n))
+            else:
+                low = n.lower()
+                matches = [i for i, bn in enumerate(robot_body_names) if low in bn.lower()]
+                if len(matches) == 1:
+                    robot_ids.append(matches[0])
+                else:
+                    return [], torch.empty(0, dtype=torch.long, device=self.device), torch.empty(0, dtype=torch.long, device=self.device)
+
+        return (
+            resolved_names,
+            torch.tensor(sensor_ids, dtype=torch.long, device=self.device),
+            torch.tensor(robot_ids, dtype=torch.long, device=self.device),
+        )
+
+    def _init_eval_gait_metric_buffers(self) -> None:
+        names, sensor_ids, robot_ids = self._resolve_eval_foot_body_names()
+        self._eval_gait_resolved_foot_names = names
+        self._eval_gait_foot_sensor_ids = sensor_ids
+        self._eval_gait_foot_robot_ids = robot_ids
+        self._eval_gait_ready = bool(sensor_ids.numel() >= 4 and robot_ids.numel() >= 4)
+
+        n = self.num_envs
+        f = int(sensor_ids.numel())
+        self._eval_ep_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._eval_cmd_speed_sum = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_actual_speed_sum = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_nonzero_cmd_steps = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_stand_cmd_steps = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_path_length = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_progress_distance = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_gait_valid_steps = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_gait_quad_support_steps = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._eval_gait_touchdown_count = torch.zeros((n, f), dtype=torch.float32, device=self.device)
+        self._eval_gait_slip_distance = torch.zeros((n, f), dtype=torch.float32, device=self.device)
+        self._eval_prev_contact = torch.zeros((n, f), dtype=torch.bool, device=self.device)
+
+        all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        self._reset_eval_gait_metric_buffers(all_env_ids)
+
+    def _init_critical_command_governor(self, cfg: Any) -> None:
+        """Initialize critical-scenario command governor state."""
+        self._phm_scenario_id = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._phm_scenario_id_critical = int(getattr(cfg, "phm_scenario_id_critical", 4))
+
+        self._crit_governor_enable = bool(getattr(cfg, "critical_governor_enable", False))
+        self._crit_v_cap_norm = float(max(getattr(cfg, "critical_governor_v_cap_norm", 0.15), 0.0))
+        self._crit_wz_cap = float(max(getattr(cfg, "critical_governor_wz_cap", 0.0), 0.0))
+        self._crit_ramp_tau_s = float(max(getattr(cfg, "critical_governor_ramp_tau_s", 2.0), 1e-6))
+        self._crit_ramp_alpha = float(
+            max(0.0, min(1.0, float(self.step_dt) / (float(self._crit_ramp_tau_s) + float(self.step_dt))))
+        )
+        self._crit_p_stand_high = float(max(0.0, min(1.0, getattr(cfg, "critical_governor_p_stand_high", 0.25))))
+        self._crit_stand_trigger_norm = float(max(getattr(cfg, "critical_governor_stand_trigger_norm", 0.2), 0.0))
+
+        self._crit_latch_hold_steps = max(int(getattr(cfg, "critical_governor_latch_hold_steps", 100)), 0)
+        self._crit_unlatch_stable_steps_req = max(
+            int(getattr(cfg, "critical_governor_unlatch_stable_steps", 50)), 1
+        )
+        self._crit_unlatch_cmd_norm = float(max(getattr(cfg, "critical_governor_unlatch_cmd_norm", 0.1), 0.0))
+        self._crit_unlatch_require_low_cmd = bool(
+            getattr(cfg, "critical_governor_unlatch_require_low_cmd", True)
+        )
+        self._crit_unlatch_require_sat_recovery = bool(
+            getattr(cfg, "critical_governor_unlatch_require_sat_recovery", False)
+        )
+        self._crit_pose_roll_pitch_max_rad = float(
+            max(getattr(cfg, "critical_governor_pose_roll_pitch_max_rad", 0.25), 0.0)
+        )
+        self._crit_pose_height_margin_m = float(max(getattr(cfg, "critical_governor_pose_height_margin_m", 0.05), 0.0))
+        self._crit_safe_height_min = float(BASE_HEIGHT_MIN) + float(self._crit_pose_height_margin_m)
+        self._crit_sat_thr = float(max(getattr(cfg, "critical_governor_sat_thr", 0.99), 0.0))
+        self._crit_sat_window_steps = max(int(getattr(cfg, "critical_governor_sat_window_steps", 15)), 1)
+        self._crit_sat_trigger = float(max(getattr(cfg, "critical_governor_sat_trigger", 0.95), 0.0))
+        self._crit_sat_trigger_hi = float(
+            max(getattr(cfg, "critical_governor_sat_trigger_hi", self._crit_sat_trigger), 0.0)
+        )
+        self._crit_sat_trigger_lo = float(
+            max(
+                0.0,
+                min(
+                    self._crit_sat_trigger_hi,
+                    getattr(cfg, "critical_governor_sat_trigger_lo", self._crit_sat_trigger_hi),
+                ),
+            )
+        )
+        # Keep legacy field as alias of high trigger for downstream metadata compatibility.
+        self._crit_sat_trigger = float(self._crit_sat_trigger_hi)
+        self._crit_sat_latch = SatRatioLatch(
+            num_envs=self.num_envs,
+            device=self.device,
+            cfg=SatLatchCfg(
+                sat_thr=float(self._crit_sat_thr),
+                window_steps=int(self._crit_sat_window_steps),
+                trigger=float(self._crit_sat_trigger_hi),
+            ),
+        )
+        self._crit_sat_any = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._crit_sat_ratio = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._crit_sat_over_trigger = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._crit_action_delta_norm_step = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._crit_cmd_delta_norm_step = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._crit_governor_mode_step = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._crit_cmd_delta_low_eps = float(
+            max(getattr(cfg, "critical_governor_cmd_delta_low_eps", 1e-3), 0.0)
+        )
+        self._crit_warn_latched_cmd_delta_ratio = float(
+            max(
+                0.0,
+                min(1.0, getattr(cfg, "critical_governor_warn_latched_cmd_delta_ratio", 0.90)),
+            )
+        )
+        self._crit_warn_min_latched_frac = float(
+            max(0.0, min(1.0, getattr(cfg, "critical_governor_warn_min_latched_frac", 0.30)))
+        )
+        self._crit_warn_every_steps = max(
+            int(getattr(cfg, "critical_governor_warn_every_steps", 200)),
+            1,
+        )
+        self._crit_warn_step_i = 0
+        self._gov_sat_ratio_step: torch.Tensor | None = None
+        self._gov_sat_any_over_1p00_step: torch.Tensor | None = None
+        self._gov_sat_valid_step: torch.Tensor | None = None
+        self._debug_gov_sat = os.getenv("DEBUG_GOV_SAT", "0") == "1"
+        self._debug_gov_sat_every = max(int(os.getenv("DEBUG_GOV_SAT_EVERY", "25")), 1)
+        self._debug_gov_sat_step_i = 0
+
+        self._crit_cmd_raw = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self._crit_cmd_eff = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self._crit_last_cmd_eff = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self._crit_episode_steps = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._crit_is_stand_episode = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._crit_latch_steps_remaining = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._crit_need_unlatch = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._crit_unlatch_stable_steps = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._crit_latch_trigger_count_ep = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+
+        self._base_velocity_cmd_write_through = False
+        self._base_velocity_cmd_write_check_done = False
+        self._crit_governor_cmd_write_warned = False
+        if self._crit_governor_enable:
+            logging.info(
+                "[CriticalGovernor] enabled=True v_cap_norm=%.3f wz_cap=%.3f ramp_tau=%.2fs "
+                "p_stand=%.2f stand_trigger=%.3f latch_hold=%d unlatch_steps=%d "
+                "sat_trigger_hi=%.3f sat_trigger_lo=%.3f unlatch_low_cmd=%s unlatch_sat_recovery=%s",
+                self._crit_v_cap_norm,
+                self._crit_wz_cap,
+                self._crit_ramp_tau_s,
+                self._crit_p_stand_high,
+                self._crit_stand_trigger_norm,
+                self._crit_latch_hold_steps,
+                self._crit_unlatch_stable_steps_req,
+                self._crit_sat_trigger_hi,
+                self._crit_sat_trigger_lo,
+                str(self._crit_unlatch_require_low_cmd),
+                str(self._crit_unlatch_require_sat_recovery),
+            )
+
+    def _reset_critical_command_governor(self, env_ids: torch.Tensor) -> None:
+        """Reset governor episode states for selected environments."""
+        if env_ids.numel() == 0:
+            return
+        ids = env_ids.to(device=self.device, dtype=torch.long)
+        self._crit_cmd_raw[ids] = 0.0
+        self._crit_cmd_eff[ids] = 0.0
+        self._crit_last_cmd_eff[ids] = 0.0
+        self._crit_episode_steps[ids] = 0
+        self._crit_is_stand_episode[ids] = False
+        self._crit_latch_steps_remaining[ids] = 0
+        self._crit_need_unlatch[ids] = False
+        self._crit_unlatch_stable_steps[ids] = 0
+        self._crit_latch_trigger_count_ep[ids] = 0.0
+        self._crit_sat_any[ids] = False
+        self._crit_sat_ratio[ids] = 0.0
+        self._crit_sat_over_trigger[ids] = False
+        self._crit_action_delta_norm_step[ids] = 0.0
+        self._crit_cmd_delta_norm_step[ids] = 0.0
+        self._crit_governor_mode_step[ids] = 0
+        self._crit_sat_latch.reset(ids)
+        if isinstance(self._gov_sat_ratio_step, torch.Tensor):
+            self._gov_sat_ratio_step[ids] = 0.0
+        if isinstance(self._gov_sat_any_over_1p00_step, torch.Tensor):
+            self._gov_sat_any_over_1p00_step[ids] = False
+        if isinstance(self._gov_sat_valid_step, torch.Tensor):
+            self._gov_sat_valid_step[ids] = False
+
+    def _cache_governor_sat_inputs(self) -> None:
+        """Cache per-step saturation tensors so eval diagnostics and governor use the same source."""
+        sat = getattr(getattr(self, "phm_state", None), "torque_saturation", None)
+        if not isinstance(sat, torch.Tensor) or sat.ndim != 2 or sat.shape[0] != self.num_envs:
+            self._gov_sat_ratio_step = None
+            self._gov_sat_any_over_1p00_step = None
+            self._gov_sat_valid_step = None
+            return
+
+        sat_ratio = sat.to(dtype=torch.float32, device=self.device)
+        sat_valid = torch.isfinite(sat_ratio).all(dim=-1)
+        sat_ratio = torch.nan_to_num(sat_ratio, nan=0.0, posinf=0.0, neginf=0.0)
+        sat_any_over_1p00 = (sat_ratio > 1.0).any(dim=-1) & sat_valid
+
+        self._gov_sat_ratio_step = sat_ratio
+        self._gov_sat_any_over_1p00_step = sat_any_over_1p00
+        self._gov_sat_valid_step = sat_valid
+
+    def _update_critical_sat_ratio_latch(self) -> None:
+        """Update saturation ratio latch once per control step (not per physics substep)."""
+        sat_ratio = getattr(self, "_gov_sat_ratio_step", None)
+        sat_valid = getattr(self, "_gov_sat_valid_step", None)
+        if not isinstance(sat_ratio, torch.Tensor):
+            # Fallback path for safety when cache was not populated.
+            self._cache_governor_sat_inputs()
+            sat_ratio = getattr(self, "_gov_sat_ratio_step", None)
+            sat_valid = getattr(self, "_gov_sat_valid_step", None)
+        if not isinstance(sat_ratio, torch.Tensor):
+            self._crit_sat_any[:] = False
+            self._crit_sat_ratio[:] = 0.0
+            self._crit_sat_over_trigger[:] = False
+            return
+        if sat_ratio.ndim != 2 or sat_ratio.shape[0] != self.num_envs:
+            self._crit_sat_any[:] = False
+            self._crit_sat_ratio[:] = 0.0
+            self._crit_sat_over_trigger[:] = False
+            return
+        sat_any, sat_ratio_window, sat_over_trigger = self._crit_sat_latch.update(
+            sat_ratio,
+            valid_mask=sat_valid if isinstance(sat_valid, torch.Tensor) else None,
+        )
+        self._crit_sat_any[:] = sat_any
+        # Keep mirrored cache for legacy readers; SSOT is SatRatioLatch.ratio.
+        self._crit_sat_ratio[:] = self._crit_sat_latch.ratio
+        self._crit_sat_over_trigger[:] = sat_over_trigger
+
+        if self._debug_gov_sat and (self._debug_gov_sat_step_i % self._debug_gov_sat_every == 0):
+            eval_any = getattr(self, "_gov_sat_any_over_1p00_step", None)
+            eval_any_mean = float(eval_any.float().mean().item()) if isinstance(eval_any, torch.Tensor) else -1.0
+            gov_any_mean = float(sat_any.float().mean().item())
+            valid_mean = (
+                float(sat_valid.float().mean().item())
+                if isinstance(sat_valid, torch.Tensor)
+                else 1.0
+            )
+            print(
+                f"[GOV_SAT] step={self._debug_gov_sat_step_i} thr={self._crit_sat_thr:.3f} "
+                f"sat_ratio(min/mean/max)=({float(sat_ratio.min().item()):.3f}/"
+                f"{float(sat_ratio.mean().item()):.3f}/{float(sat_ratio.max().item()):.3f}) "
+                f"eval_any>1.0={eval_any_mean:.3f} gov_any>thr={gov_any_mean:.3f} valid={valid_mean:.3f}",
+                flush=True,
+            )
+            if isinstance(eval_any, torch.Tensor):
+                mismatch = eval_any & (~sat_any)
+                if isinstance(sat_valid, torch.Tensor):
+                    mismatch = mismatch & sat_valid
+                if bool(torch.any(mismatch).item()):
+                    ids = mismatch.nonzero(as_tuple=False).flatten().tolist()
+                    print(
+                        f"[GOV_SAT_MISMATCH] env_ids={ids} "
+                        "(eval_any>1.0 True but gov_any>thr False)",
+                        flush=True,
+                    )
+        self._debug_gov_sat_step_i += 1
+
+    def _validate_base_command_write_through_once(self) -> None:
+        """
+        Validate whether get_command('base_velocity') tensor supports in-place write-through.
+
+        Always restores original command tensor before returning.
+        """
+        if self._base_velocity_cmd_write_check_done:
+            return
+        self._base_velocity_cmd_write_check_done = True
+        self._base_velocity_cmd_write_through = False
+        original_cmd = None
+        try:
+            cmd = self.command_manager.get_command("base_velocity")
+            if not isinstance(cmd, torch.Tensor) or cmd.ndim < 2 or cmd.shape[0] == 0 or cmd.shape[1] < 3:
+                return
+            original_cmd = cmd.clone()
+            probe_val = float(cmd[0, 0].item()) + 0.12345
+            cmd[0, 0] = probe_val
+            cmd_recheck = self.command_manager.get_command("base_velocity")
+            if isinstance(cmd_recheck, torch.Tensor) and cmd_recheck.ndim >= 2:
+                self._base_velocity_cmd_write_through = bool(
+                    torch.isclose(cmd_recheck[0, 0], torch.tensor(probe_val, device=self.device), atol=1e-6).item()
+                )
+            cmd[:] = original_cmd
+        except Exception as err:
+            logging.warning("[CriticalGovernor] base_velocity write-through check failed: %s", err)
+        finally:
+            if original_cmd is not None:
+                try:
+                    cmd_restore = self.command_manager.get_command("base_velocity")
+                    if isinstance(cmd_restore, torch.Tensor) and cmd_restore.shape == original_cmd.shape:
+                        cmd_restore[:] = original_cmd
+                except Exception:
+                    pass
+
+        logging.info(
+            "[CriticalGovernor] base_velocity write_through=%s",
+            bool(self._base_velocity_cmd_write_through),
+        )
+
+    def _get_base_velocity_command_tensor(self) -> torch.Tensor | None:
+        """Resolve writable base-velocity command tensor."""
+        try:
+            cmd = self.command_manager.get_command("base_velocity")
+        except Exception:
+            return None
+
+        if isinstance(cmd, torch.Tensor) and self._base_velocity_cmd_write_through:
+            return cmd
+
+        try:
+            term = self.command_manager.get_term("base_velocity")
+            for key in ("command", "_command", "commands", "_commands", "cmd", "_cmd"):
+                buf = getattr(term, key, None)
+                if isinstance(buf, torch.Tensor) and buf.ndim >= 2 and buf.shape[0] == self.num_envs and buf.shape[1] >= 3:
+                    return buf
+        except Exception:
+            pass
+
+        if (
+            isinstance(cmd, torch.Tensor)
+            and cmd.ndim >= 2
+            and cmd.shape[0] == self.num_envs
+            and cmd.shape[1] >= 3
+            and self._base_velocity_cmd_write_through
+        ):
+            return cmd
+        if not self._crit_governor_cmd_write_warned:
+            logging.warning(
+                "[CriticalGovernor] writable base_velocity command buffer not found; governor update skipped."
+            )
+            self._crit_governor_cmd_write_warned = True
+        return None
+
+    def _apply_critical_command_governor(self) -> None:
+        """Apply critical-scenario command governor after command_manager.compute()."""
+        cmd_buf = self._get_base_velocity_command_tensor()
+        if cmd_buf is None or cmd_buf.ndim < 2 or cmd_buf.shape[1] < 3:
+            return
+
+        raw_cmd = cmd_buf[:, :3].clone()
+        self._crit_cmd_raw[:] = raw_cmd
+        self._crit_cmd_eff[:] = raw_cmd
+        self._crit_governor_mode_step[:] = 0
+
+        if not self._crit_governor_enable:
+            self._crit_cmd_delta_norm_step[:] = 0.0
+            if hasattr(self, "extras"):
+                self.extras["cmd/base_velocity_raw"] = torch.mean(raw_cmd, dim=0)
+                self.extras["cmd/base_velocity_eff"] = torch.mean(raw_cmd, dim=0)
+                self.extras["crit/is_active"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_step"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_none"] = torch.tensor(1.0, device=self.device)
+                self.extras["crit/governor_mode_v_cap"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_stand"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_stop_latch"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_other"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/sat_thr"] = torch.tensor(float(self._crit_sat_thr), device=self.device)
+                self.extras["crit/sat_window_steps"] = torch.tensor(float(self._crit_sat_window_steps), device=self.device)
+                self.extras["crit/sat_any_over_thr_ratio"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/sat_trigger"] = torch.tensor(float(self._crit_sat_trigger_hi), device=self.device)
+                self.extras["crit/sat_trigger_hi"] = torch.tensor(float(self._crit_sat_trigger_hi), device=self.device)
+                self.extras["crit/sat_trigger_lo"] = torch.tensor(float(self._crit_sat_trigger_lo), device=self.device)
+                self.extras["crit/is_latched"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/cmd_delta_low_eps"] = torch.tensor(float(self._crit_cmd_delta_low_eps), device=self.device)
+                self.extras["crit/latched_low_cmd_delta_ratio"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/action_delta_latched_norm_mean"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/action_delta_latched_norm_max"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/cmd_delta_latched_norm_mean"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/cmd_delta_latched_norm_max"] = torch.tensor(0.0, device=self.device)
+            return
+
+        critical_mask = self._phm_scenario_id == int(self._phm_scenario_id_critical)
+        non_critical_mask = ~critical_mask
+        if torch.any(non_critical_mask):
+            self._crit_episode_steps[non_critical_mask] = 0
+            self._crit_is_stand_episode[non_critical_mask] = False
+            self._crit_latch_steps_remaining[non_critical_mask] = 0
+            self._crit_need_unlatch[non_critical_mask] = False
+            self._crit_unlatch_stable_steps[non_critical_mask] = 0
+            self._crit_latch_trigger_count_ep[non_critical_mask] = 0.0
+
+        if torch.any(critical_mask):
+            raw_norm = torch.norm(raw_cmd[:, :2], dim=1)
+            episode_start_mask = critical_mask & (self._crit_episode_steps <= 0)
+            if torch.any(episode_start_mask):
+                start_ids = episode_start_mask.nonzero(as_tuple=False).squeeze(-1)
+                eligible = raw_norm[start_ids] >= float(self._crit_stand_trigger_norm)
+                sampled = torch.rand((start_ids.numel(),), device=self.device) < float(self._crit_p_stand_high)
+                self._crit_is_stand_episode[start_ids] = eligible & sampled
+                self._crit_latch_steps_remaining[start_ids] = 0
+                self._crit_need_unlatch[start_ids] = False
+                self._crit_unlatch_stable_steps[start_ids] = 0
+
+            target_cmd = raw_cmd.clone()
+            raw_norm_safe = torch.clamp(raw_norm, min=1e-6)
+            scale = torch.minimum(
+                torch.ones_like(raw_norm_safe),
+                torch.full_like(raw_norm_safe, float(self._crit_v_cap_norm)) / raw_norm_safe,
+            )
+            target_cmd[:, 0] = raw_cmd[:, 0] * scale
+            target_cmd[:, 1] = raw_cmd[:, 1] * scale
+            target_cmd[:, 2] = torch.clamp(raw_cmd[:, 2], -float(self._crit_wz_cap), float(self._crit_wz_cap))
+
+            stand_mode_mask = critical_mask & self._crit_is_stand_episode
+            if torch.any(stand_mode_mask):
+                target_cmd[stand_mode_mask] = 0.0
+
+            if self._crit_latch_hold_steps > 0:
+                active_latch = self._crit_latch_steps_remaining > 0
+                self._crit_latch_steps_remaining[active_latch] -= 1
+
+            tilt = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            if hasattr(self.robot.data, "projected_gravity_b"):
+                gravity_b = self.robot.data.projected_gravity_b
+                tilt = torch.acos(torch.clamp(-gravity_b[:, 2], min=-1.0, max=1.0))
+            root_height = torch.full((self.num_envs,), float(self._crit_safe_height_min + 1.0), device=self.device)
+            if hasattr(self.robot.data, "root_pos_w"):
+                root_height = self.robot.data.root_pos_w[:, 2]
+
+            brownout_latched = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+            if hasattr(self.phm_state, "brownout_latched"):
+                brownout_latched = self.phm_state.brownout_latched
+
+            pose_unstable = (tilt > float(self._crit_pose_roll_pitch_max_rad)) | (
+                root_height < float(self._crit_safe_height_min)
+            )
+            sat_unstable = self._crit_sat_over_trigger
+            trigger_mask = critical_mask & (pose_unstable | sat_unstable | brownout_latched)
+            if torch.any(trigger_mask):
+                self._crit_latch_steps_remaining[trigger_mask] = int(self._crit_latch_hold_steps)
+                self._crit_need_unlatch[trigger_mask] = True
+                self._crit_unlatch_stable_steps[trigger_mask] = 0
+                self._crit_latch_trigger_count_ep[trigger_mask] += 1.0
+
+            hard_latch_mask = critical_mask & (self._crit_latch_steps_remaining > 0)
+            post_hold_mask = critical_mask & self._crit_need_unlatch & (~hard_latch_mask)
+            if torch.any(post_hold_mask):
+                stable_now = (
+                    (tilt <= float(self._crit_pose_roll_pitch_max_rad))
+                    & (root_height >= float(self._crit_safe_height_min))
+                )
+                if self._crit_unlatch_require_low_cmd:
+                    stable_now = stable_now & (raw_norm <= float(self._crit_unlatch_cmd_norm))
+                if self._crit_unlatch_require_sat_recovery:
+                    sat_ratio_now = self._crit_sat_latch.ratio
+                    stable_now = stable_now & (sat_ratio_now <= float(self._crit_sat_trigger_lo))
+                stable_ids = post_hold_mask.nonzero(as_tuple=False).squeeze(-1)
+                prev = self._crit_unlatch_stable_steps[stable_ids]
+                self._crit_unlatch_stable_steps[stable_ids] = torch.where(
+                    stable_now[stable_ids],
+                    prev + 1,
+                    torch.zeros_like(prev),
+                )
+                unlatch_done = stable_ids[
+                    self._crit_unlatch_stable_steps[stable_ids] >= int(self._crit_unlatch_stable_steps_req)
+                ]
+                if unlatch_done.numel() > 0:
+                    self._crit_need_unlatch[unlatch_done] = False
+                    self._crit_unlatch_stable_steps[unlatch_done] = 0
+
+            soft_latch_mask = critical_mask & self._crit_need_unlatch & (self._crit_latch_steps_remaining <= 0)
+            latched_mask = hard_latch_mask | soft_latch_mask
+
+            eff_cmd = raw_cmd.clone()
+            crit_ids = critical_mask.nonzero(as_tuple=False).squeeze(-1)
+            eff_cmd[crit_ids] = self._crit_last_cmd_eff[crit_ids] + float(self._crit_ramp_alpha) * (
+                target_cmd[crit_ids] - self._crit_last_cmd_eff[crit_ids]
+            )
+            if torch.any(latched_mask):
+                eff_cmd[latched_mask] = 0.0
+            eff_cmd[non_critical_mask] = raw_cmd[non_critical_mask]
+
+            self._crit_last_cmd_eff[:] = eff_cmd
+            self._crit_cmd_eff[:] = eff_cmd
+            self._crit_cmd_delta_norm_step[:] = torch.norm(self._crit_cmd_eff - self._crit_cmd_raw, dim=1)
+            cmd_buf[:, :3] = eff_cmd
+            self._crit_episode_steps[critical_mask] += 1
+
+            # Governor mode taxonomy per step:
+            # 0=none, 1=v_cap, 2=stand, 3=stop_latch, 4=other.
+            cap_xy_applied = scale < (1.0 - 1e-6)
+            cap_wz_applied = torch.abs(raw_cmd[:, 2]) > (float(self._crit_wz_cap) + 1e-6)
+            mode_step = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+            v_cap_mask = critical_mask & (cap_xy_applied | cap_wz_applied)
+            mode_step[v_cap_mask] = 1
+            mode_step[stand_mode_mask] = 2
+            mode_step[latched_mask] = 3
+            self._crit_governor_mode_step[:] = mode_step
+
+        if hasattr(self, "extras"):
+            self.extras["cmd/base_velocity_raw"] = torch.mean(self._crit_cmd_raw, dim=0)
+            self.extras["cmd/base_velocity_eff"] = torch.mean(self._crit_cmd_eff, dim=0)
+            self.extras["crit/is_active"] = torch.mean(critical_mask.float())
+            self.extras["crit/is_stand_episode"] = torch.mean(self._crit_is_stand_episode.float())
+            latched = (self._crit_latch_steps_remaining > 0) | self._crit_need_unlatch
+            self.extras["crit/is_latched"] = torch.mean(latched.float())
+            self.extras["crit/latch_steps_remaining"] = torch.mean(self._crit_latch_steps_remaining.float())
+            self.extras["crit/latch_trigger_rate"] = torch.mean((self._crit_latch_trigger_count_ep > 0).float())
+            self.extras["crit/cmd_raw_norm_mean"] = torch.mean(torch.norm(self._crit_cmd_raw[:, :2], dim=1))
+            self.extras["crit/cmd_eff_norm_mean"] = torch.mean(torch.norm(self._crit_cmd_eff[:, :2], dim=1))
+            self.extras["crit/cmd_delta_low_eps"] = torch.tensor(float(self._crit_cmd_delta_low_eps), device=self.device)
+            if torch.any(latched):
+                self.extras["crit/action_delta_latched_norm_mean"] = torch.mean(self._crit_action_delta_norm_step[latched])
+                self.extras["crit/action_delta_latched_norm_max"] = torch.max(self._crit_action_delta_norm_step[latched])
+                self.extras["crit/cmd_delta_latched_norm_mean"] = torch.mean(self._crit_cmd_delta_norm_step[latched])
+                self.extras["crit/cmd_delta_latched_norm_max"] = torch.max(self._crit_cmd_delta_norm_step[latched])
+                latched_low_cmd_delta_ratio = torch.mean(
+                    (self._crit_cmd_delta_norm_step[latched] <= float(self._crit_cmd_delta_low_eps)).float()
+                )
+            else:
+                self.extras["crit/action_delta_latched_norm_mean"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/action_delta_latched_norm_max"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/cmd_delta_latched_norm_mean"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/cmd_delta_latched_norm_max"] = torch.tensor(0.0, device=self.device)
+                latched_low_cmd_delta_ratio = torch.tensor(0.0, device=self.device)
+            self.extras["crit/latched_low_cmd_delta_ratio"] = latched_low_cmd_delta_ratio
+            crit_count = torch.sum(critical_mask)
+            if int(crit_count.item()) > 0:
+                self.extras["crit/sat_any_over_thr_ratio"] = torch.mean(self._crit_sat_latch.ratio[critical_mask])
+                self.extras["crit/is_latched"] = torch.mean(latched[critical_mask].float())
+                self.extras["crit/sat_ratio_valid_steps"] = torch.mean(
+                    self._crit_sat_latch.valid_steps[critical_mask].float()
+                )
+                mode_crit = self._crit_governor_mode_step[critical_mask]
+                self.extras["crit/governor_mode_step"] = torch.mean(mode_crit.float())
+                self.extras["crit/governor_mode_none"] = torch.mean((mode_crit == 0).float())
+                self.extras["crit/governor_mode_v_cap"] = torch.mean((mode_crit == 1).float())
+                self.extras["crit/governor_mode_stand"] = torch.mean((mode_crit == 2).float())
+                self.extras["crit/governor_mode_stop_latch"] = torch.mean((mode_crit == 3).float())
+                self.extras["crit/governor_mode_other"] = torch.mean((mode_crit == 4).float())
+                latched_crit = latched[critical_mask]
+                latched_frac = float(torch.mean(latched_crit.float()).item())
+                low_delta_ratio = float(latched_low_cmd_delta_ratio.detach().cpu().item())
+                if (
+                    (self._crit_warn_step_i % int(self._crit_warn_every_steps)) == 0
+                    and latched_frac >= float(self._crit_warn_min_latched_frac)
+                    and low_delta_ratio >= float(self._crit_warn_latched_cmd_delta_ratio)
+                ):
+                    logging.warning(
+                        "[CriticalGovernor] latched but low cmd-delta dominated: "
+                        "latched_frac=%.3f low_delta_ratio=%.3f eps=%.4f",
+                        latched_frac,
+                        low_delta_ratio,
+                        float(self._crit_cmd_delta_low_eps),
+                    )
+            else:
+                self.extras["crit/sat_any_over_thr_ratio"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/sat_ratio_valid_steps"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_step"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_none"] = torch.tensor(1.0, device=self.device)
+                self.extras["crit/governor_mode_v_cap"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_stand"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_stop_latch"] = torch.tensor(0.0, device=self.device)
+                self.extras["crit/governor_mode_other"] = torch.tensor(0.0, device=self.device)
+            self.extras["crit/sat_thr"] = torch.tensor(float(self._crit_sat_thr), device=self.device)
+            self.extras["crit/sat_window_steps"] = torch.tensor(float(self._crit_sat_window_steps), device=self.device)
+            self.extras["crit/sat_trigger"] = torch.tensor(float(self._crit_sat_trigger_hi), device=self.device)
+            self.extras["crit/sat_trigger_hi"] = torch.tensor(float(self._crit_sat_trigger_hi), device=self.device)
+            self.extras["crit/sat_trigger_lo"] = torch.tensor(float(self._crit_sat_trigger_lo), device=self.device)
+        self._crit_warn_step_i += 1
+
+    def _reset_eval_gait_metric_buffers(self, env_ids: torch.Tensor) -> None:
+        if env_ids.numel() == 0:
+            return
+        ids = env_ids.to(device=self.device, dtype=torch.long)
+        self._eval_ep_steps[ids] = 0
+        self._eval_cmd_speed_sum[ids] = 0.0
+        self._eval_actual_speed_sum[ids] = 0.0
+        self._eval_nonzero_cmd_steps[ids] = 0.0
+        self._eval_stand_cmd_steps[ids] = 0.0
+        self._eval_path_length[ids] = 0.0
+        self._eval_progress_distance[ids] = 0.0
+        self._eval_gait_valid_steps[ids] = 0.0
+        self._eval_gait_quad_support_steps[ids] = 0.0
+        if self._eval_gait_touchdown_count.shape[1] > 0:
+            self._eval_gait_touchdown_count[ids] = 0.0
+            self._eval_gait_slip_distance[ids] = 0.0
+            self._eval_prev_contact[ids] = False
+
+            sensor = self._get_eval_contact_sensor()
+            if sensor is not None and hasattr(sensor.data, "net_forces_w") and self._eval_gait_ready:
+                forces = sensor.data.net_forces_w[ids][:, self._eval_gait_foot_sensor_ids, :]
+                contact_force = torch.norm(forces, dim=-1)
+                self._eval_prev_contact[ids] = contact_force > self._eval_gait_contact_force_threshold
+
+    def _update_eval_gait_metric_buffers(self) -> None:
+        if not self.enable_eval_gait_metrics or not self._enable_terminal_snapshot:
+            return
+
+        cmd = self.command_manager.get_command("base_velocity")
+        cmd_xy = cmd[:, :2]
+        cmd_speed = torch.norm(cmd_xy, dim=1)
+        vel_xy = self.robot.data.root_lin_vel_b[:, :2]
+        actual_speed = torch.norm(vel_xy, dim=1)
+        cmd_dir = cmd_xy / (cmd_speed.unsqueeze(-1) + 1e-6)
+        progress_speed = torch.sum(vel_xy * cmd_dir, dim=1)
+        progress_speed = torch.where(cmd_speed > 1e-3, progress_speed, torch.zeros_like(progress_speed))
+
+        self._eval_ep_steps += 1
+        self._eval_cmd_speed_sum += cmd_speed
+        self._eval_actual_speed_sum += actual_speed
+        self._eval_nonzero_cmd_steps += (cmd_speed > self._eval_nonzero_cmd_threshold).to(torch.float32)
+        self._eval_stand_cmd_steps += (cmd_speed < self._eval_stand_cmd_threshold).to(torch.float32)
+        self._eval_path_length += actual_speed * float(self.step_dt)
+        self._eval_progress_distance += torch.clamp(progress_speed, min=0.0) * float(self.step_dt)
+
+        sensor = self._get_eval_contact_sensor()
+        if sensor is None or not self._eval_gait_ready:
+            return
+        if not hasattr(sensor.data, "net_forces_w") or not hasattr(self.robot.data, "body_lin_vel_w"):
+            return
+
+        forces = sensor.data.net_forces_w[:, self._eval_gait_foot_sensor_ids, :]
+        contact_force = torch.norm(forces, dim=-1)
+        thr_on = float(self._eval_gait_contact_force_threshold)
+        thr_off = 0.6 * thr_on
+        prev_contact = self._eval_prev_contact
+        contact = torch.where(prev_contact, contact_force > thr_off, contact_force > thr_on)
+        touchdown = (~prev_contact) & contact
+        self._eval_gait_touchdown_count += touchdown.to(torch.float32)
+        self._eval_prev_contact = contact
+        self._eval_gait_quad_support_steps += torch.all(contact, dim=1).to(torch.float32)
+        self._eval_gait_valid_steps += 1.0
+
+        foot_vel_xy = self.robot.data.body_lin_vel_w[:, self._eval_gait_foot_robot_ids, :2]
+        foot_speed_xy = torch.norm(foot_vel_xy, dim=-1)
+        self._eval_gait_slip_distance += contact.to(torch.float32) * foot_speed_xy * float(self.step_dt)
 
     def _init_velocity_command_curriculum(self, cfg: Any) -> None:
         """Initialize staged velocity-command range widening for locomotion training."""
@@ -788,7 +1497,9 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
         # ---------------------------------------------------------------------
         # 2. Action Processing & Sensor Sample-and-Hold
         # ---------------------------------------------------------------------
-        action_in = self._apply_command_transport_dr(action.to(self.device))
+        action_device = action.to(self.device)
+        action_in = self._apply_command_transport_dr(action_device)
+        self._crit_action_delta_norm_step[:] = torch.norm(action_in - action_device, dim=1)
         self.action_manager.process_action(action_in)
         self.recorder_manager.record_pre_step()
         
@@ -895,6 +1606,14 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
+        # Evaluation-only gait/motion evidence buffers.
+        self._update_eval_gait_metric_buffers()
+        # Cache per-step saturation source once so governor and eval diagnostics share it.
+        self._cache_governor_sat_inputs()
+        # Update saturation latch before terminations/snapshot so terminal metrics
+        # can see the current control-step saturation evidence.
+        self._update_critical_sat_ratio_latch()
+
         # Terminations & Rewards
         self.reset_buf = self.termination_manager.compute()
         self.rew_buf = self.reward_manager.compute(dt=self.step_dt)
@@ -912,6 +1631,7 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
         self._update_dr_curriculum()
         self._update_push_curriculum()
         self.command_manager.compute(dt=self.step_dt)
+        self._apply_critical_command_governor()
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
@@ -1015,6 +1735,10 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
                 self.robot.data.joint_effort_limits[env_ids_t] = final_limits
                 if hasattr(self.robot, "write_joint_effort_limit_to_sim"):
                     self.robot.write_joint_effort_limit_to_sim(final_limits, env_ids=env_ids_t)
+
+        # Evaluation-only gait/motion evidence buffers.
+        self._reset_eval_gait_metric_buffers(env_ids_t)
+        self._reset_critical_command_governor(env_ids_t)
 
     # -------------------------------------------------------------------------
     # Helper Methods
@@ -1314,6 +2038,56 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
         recon_mae = float(torch.mean(torch.abs(recon - target_reward)).item())
         return contrib, use_dt, recon_mae
 
+    def _thermal_termination_params(self) -> tuple[bool, float]:
+        """Read thermal termination config for backward-compatible defaults."""
+        use_case_proxy = False
+        coil_to_case_delta_c = 5.0
+        term_cfg = getattr(getattr(self, "cfg", None), "terminations", None)
+        thermal_failure = getattr(term_cfg, "thermal_failure", None) if term_cfg is not None else None
+        params = getattr(thermal_failure, "params", None)
+        if isinstance(params, dict):
+            use_case_proxy = bool(params.get("use_case_proxy", use_case_proxy))
+            coil_to_case_delta_c = float(params.get("coil_to_case_delta_c", coil_to_case_delta_c))
+        return use_case_proxy, coil_to_case_delta_c
+
+    def _temperature_metric_semantics(self) -> str:
+        """Resolve metric temperature channel from explicit cfg, with safe fallback."""
+        cfg = getattr(self, "cfg", None)
+        explicit = str(getattr(cfg, "temperature_metric_semantics", "")).strip().lower()
+        if explicit in {"case_proxy", "case", "case_like"}:
+            return "case_proxy"
+        if explicit in {"coil_hotspot", "coil"}:
+            return "coil_hotspot"
+        use_case_proxy, _ = self._thermal_termination_params()
+        return "case_proxy" if use_case_proxy else "coil_hotspot"
+
+    def _case_temperature_tensor(self, env_ids: torch.Tensor | None = None) -> torch.Tensor | None:
+        """Find case/housing temperature tensor from PHM state if available."""
+        phm = self.phm_state
+        for name in ("motor_case_temp", "case_temp", "motor_temp_case", "housing_temp", "motor_housing_temp"):
+            if hasattr(phm, name):
+                val = getattr(phm, name)
+                if isinstance(val, torch.Tensor):
+                    return val if env_ids is None else val[env_ids]
+        return None
+
+    def _temperature_tensor_for_metrics(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Return task-consistent temperature tensor for logging/evaluation metrics.
+
+        Main task can use case-like proxy semantics even if hard thermal termination is disabled.
+        """
+        semantics = self._temperature_metric_semantics()
+        _, coil_to_case_delta_c = self._thermal_termination_params()
+
+        coil_temp = self.phm_state.coil_temp if env_ids is None else self.phm_state.coil_temp[env_ids]
+        if semantics == "case_proxy":
+            case_like = self._case_temperature_tensor(env_ids=env_ids)
+            if case_like is not None:
+                return case_like
+            return coil_temp - float(coil_to_case_delta_c)
+        return coil_temp
+
     def _cache_terminal_snapshot(self, env_ids: torch.Tensor):
         """Cache terminal metrics before reset so evaluators can avoid post-reset contamination."""
         if not self._enable_terminal_snapshot or env_ids.numel() == 0:
@@ -1333,34 +2107,8 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
 
         total_power = torch.sum(phm.avg_power_log[env_ids], dim=1)
 
-        # Keep terminal temperature metrics consistent with task thermal semantics:
-        # RealObs may terminate on case/housing proxy, while privileged PHM uses coil.
-        temps = phm.coil_temp[env_ids]
-        term_cfg = getattr(getattr(self, "cfg", None), "terminations", None)
-        thermal_failure = getattr(term_cfg, "thermal_failure", None) if term_cfg is not None else None
-        params = getattr(thermal_failure, "params", None)
-        use_case_proxy = False
-        coil_to_case_delta_c = 5.0
-        if isinstance(params, dict):
-            use_case_proxy = bool(params.get("use_case_proxy", use_case_proxy))
-            coil_to_case_delta_c = float(params.get("coil_to_case_delta_c", coil_to_case_delta_c))
-        if use_case_proxy:
-            case_like = None
-            for name in (
-                "motor_case_temp",
-                "case_temp",
-                "motor_temp_case",
-                "housing_temp",
-                "motor_housing_temp",
-            ):
-                if hasattr(phm, name):
-                    val = getattr(phm, name)
-                    if isinstance(val, torch.Tensor):
-                        case_like = val[env_ids]
-                        break
-            if case_like is None:
-                case_like = phm.coil_temp[env_ids] - float(coil_to_case_delta_c)
-            temps = case_like
+        # Use explicit task semantics (cfg.temperature_metric_semantics) when provided.
+        temps = self._temperature_tensor_for_metrics(env_ids=env_ids)
 
         avg_temp = torch.mean(temps, dim=1)
         max_temp = torch.max(temps, dim=1)[0]
@@ -1368,6 +2116,23 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
         soh = phm.motor_health_capacity[env_ids] - phm.fatigue_index[env_ids]
         min_soh = torch.min(soh, dim=1)[0]
         max_saturation = torch.max(phm.torque_saturation[env_ids], dim=1)[0]
+        crit_latched = ((self._crit_latch_steps_remaining[env_ids] > 0) | self._crit_need_unlatch[env_ids]).to(
+            torch.float32
+        )
+        crit_sat_any_step = self._crit_sat_any[env_ids].to(torch.float32)
+        crit_sat_ratio = self._crit_sat_latch.ratio[env_ids]
+        crit_sat_ratio_valid_steps = self._crit_sat_latch.valid_steps[env_ids].to(torch.float32)
+        crit_action_delta = self._crit_action_delta_norm_step[env_ids]
+        crit_cmd_delta = self._crit_cmd_delta_norm_step[env_ids]
+        crit_governor_mode = self._crit_governor_mode_step[env_ids].to(torch.float32)
+        crit_action_delta_latched = crit_action_delta * crit_latched
+        crit_cmd_delta_latched = crit_cmd_delta * crit_latched
+        crit_governor_enabled = torch.full(
+            (env_ids.numel(),),
+            1.0 if self._crit_governor_enable else 0.0,
+            device=self.device,
+            dtype=torch.float32,
+        )
         reward_terms, reward_dt_scaled, reward_recon_mae = self._compute_reward_term_contributions(env_ids)
 
         self._last_terminal_env_ids = env_ids.clone()
@@ -1381,7 +2146,43 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
             "max_fatigue": max_fatigue.detach().clone(),
             "min_soh": min_soh.detach().clone(),
             "max_saturation": max_saturation.detach().clone(),
+            "crit/governor_enabled": crit_governor_enabled.detach().clone(),
+            "crit/is_latched": crit_latched.detach().clone(),
+            "crit/sat_any_over_thr_step": crit_sat_any_step.detach().clone(),
+            "crit/sat_any_over_thr_ratio": crit_sat_ratio.detach().clone(),
+            "crit/sat_ratio_valid_steps": crit_sat_ratio_valid_steps.detach().clone(),
+            "crit/action_delta_norm_step": crit_action_delta.detach().clone(),
+            "crit/cmd_delta_norm_step": crit_cmd_delta.detach().clone(),
+            "crit/governor_mode_step": crit_governor_mode.detach().clone(),
+            "crit/action_delta_latched_norm_step": crit_action_delta_latched.detach().clone(),
+            "crit/cmd_delta_latched_norm_step": crit_cmd_delta_latched.detach().clone(),
         }
+
+        if self.enable_eval_gait_metrics:
+            steps = torch.clamp(self._eval_ep_steps[env_ids], min=1).to(torch.float32)
+            mean_cmd_speed_xy = self._eval_cmd_speed_sum[env_ids] / steps
+            mean_actual_speed_xy = self._eval_actual_speed_sum[env_ids] / steps
+            nonzero_cmd_ratio = self._eval_nonzero_cmd_steps[env_ids] / steps
+            stand_cmd_ratio = self._eval_stand_cmd_steps[env_ids] / steps
+            path_length_xy = self._eval_path_length[env_ids]
+            progress_distance_along_cmd = self._eval_progress_distance[env_ids]
+            self._last_terminal_metrics["motion/mean_cmd_speed_xy"] = mean_cmd_speed_xy.detach().clone()
+            self._last_terminal_metrics["motion/mean_actual_speed_xy"] = mean_actual_speed_xy.detach().clone()
+            self._last_terminal_metrics["motion/nonzero_cmd_ratio"] = nonzero_cmd_ratio.detach().clone()
+            self._last_terminal_metrics["motion/stand_cmd_ratio"] = stand_cmd_ratio.detach().clone()
+            self._last_terminal_metrics["motion/path_length_xy"] = path_length_xy.detach().clone()
+            self._last_terminal_metrics["motion/progress_distance_along_cmd"] = progress_distance_along_cmd.detach().clone()
+
+            if self._eval_gait_ready and self._eval_gait_touchdown_count.shape[1] > 0:
+                valid_steps = torch.clamp(self._eval_gait_valid_steps[env_ids], min=1.0)
+                step_count_total = torch.sum(self._eval_gait_touchdown_count[env_ids], dim=1)
+                quad_support_ratio = self._eval_gait_quad_support_steps[env_ids] / valid_steps
+                slip_distance_total = torch.sum(self._eval_gait_slip_distance[env_ids], dim=1)
+                slip_per_progress = slip_distance_total / torch.clamp(progress_distance_along_cmd, min=0.05)
+                self._last_terminal_metrics["gait/step_count_total"] = step_count_total.detach().clone()
+                self._last_terminal_metrics["gait/quad_support_ratio"] = quad_support_ratio.detach().clone()
+                self._last_terminal_metrics["gait/slip_per_progress"] = slip_per_progress.detach().clone()
+
         for term_name, term_val in reward_terms.items():
             self._last_terminal_metrics[f"reward_term/{term_name}"] = term_val.detach().clone()
         if reward_dt_scaled is not None:
@@ -1396,32 +2197,7 @@ class UnitreeGo2PhmEnv(ManagerBasedRLEnv):
 
     def _log_phm_metrics(self):
         if self.phm_state is None: return
-        temps = self.phm_state.coil_temp
-        term_cfg = getattr(getattr(self, "cfg", None), "terminations", None)
-        thermal_failure = getattr(term_cfg, "thermal_failure", None) if term_cfg is not None else None
-        params = getattr(thermal_failure, "params", None)
-        use_case_proxy = False
-        coil_to_case_delta_c = 5.0
-        if isinstance(params, dict):
-            use_case_proxy = bool(params.get("use_case_proxy", use_case_proxy))
-            coil_to_case_delta_c = float(params.get("coil_to_case_delta_c", coil_to_case_delta_c))
-        if use_case_proxy:
-            case_like = None
-            for name in (
-                "motor_case_temp",
-                "case_temp",
-                "motor_temp_case",
-                "housing_temp",
-                "motor_housing_temp",
-            ):
-                if hasattr(self.phm_state, name):
-                    val = getattr(self.phm_state, name)
-                    if isinstance(val, torch.Tensor):
-                        case_like = val
-                        break
-            if case_like is None:
-                case_like = self.phm_state.coil_temp - float(coil_to_case_delta_c)
-            temps = case_like
+        temps = self._temperature_tensor_for_metrics()
 
         self.extras["phm/avg_temp"] = torch.mean(temps)
         if hasattr(self.phm_state, "motor_case_temp"):

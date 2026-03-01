@@ -61,9 +61,19 @@ _PHM_LOG_FLAGS = {
     "thermal_reset_params_read_failed": False,
     "fault_mode_invalid_warned": False,
     "fault_fixed_id_invalid_warned": False,
+    "fault_pair_uniform_unsupported_warned": False,
     "forced_scenario_invalid_warned": False,
     "forced_scenario_info_logged": False,
 }
+
+_FAULT_MIRROR_PAIRS_12 = (
+    (0, 3),
+    (1, 4),
+    (2, 5),
+    (6, 9),
+    (7, 10),
+    (8, 11),
+)
 
 
 def _quantize_channel(x: torch.Tensor, step: float) -> torch.Tensor:
@@ -865,6 +875,8 @@ def reset_phm_interface(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
     """
     device = env.device
     num_resets = len(env_ids)
+    if (not hasattr(env, "_phm_scenario_id")) or int(getattr(env._phm_scenario_id, "numel", lambda: 0)()) != int(env.num_envs):
+        env._phm_scenario_id = torch.zeros((env.num_envs,), dtype=torch.long, device=device)
 
     # 1. 상태 및 적분기 초기화 (기존 코드 유지)
     env.phm_state.reset(env_ids)
@@ -1034,11 +1046,38 @@ def reset_phm_interface(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
             )
             _PHM_LOG_FLAGS["fault_fixed_id_invalid_warned"] = True
         fault_mode = "single_motor_random"
+    # single_motor_random stabilization controls:
+    # - mirror-uniform motor sampling (pair first, side second)
+    # - hold sampled motor id for fixed step window to equalize step exposure
+    pair_uniform_enabled_cfg = bool(getattr(cfg_obj, "phm_fault_pair_uniform_enable", True))
+    pair_uniform_enabled = pair_uniform_enabled_cfg
+    if pair_uniform_enabled and NUM_MOTORS != 12:
+        if not _PHM_LOG_FLAGS["fault_pair_uniform_unsupported_warned"]:
+            logging.warning(
+                "[PHM] phm_fault_pair_uniform_enable=True requires NUM_MOTORS=12; "
+                "fallback to uniform motor sampling (NUM_MOTORS=%s).",
+                NUM_MOTORS,
+            )
+            _PHM_LOG_FLAGS["fault_pair_uniform_unsupported_warned"] = True
+        pair_uniform_enabled = False
+    try:
+        fault_hold_steps = int(getattr(cfg_obj, "phm_fault_hold_steps", 1000))
+    except Exception:
+        fault_hold_steps = 1000
+    fault_hold_steps = max(fault_hold_steps, 0)
+    if not hasattr(env, "_phm_fault_hold_motor_id") or int(getattr(env._phm_fault_hold_motor_id, "numel", lambda: 0)()) != int(env.num_envs):
+        env._phm_fault_hold_motor_id = torch.full((env.num_envs,), -1, device=device, dtype=torch.long)
+    if not hasattr(env, "_phm_fault_hold_until_step") or int(getattr(env._phm_fault_hold_until_step, "numel", lambda: 0)()) != int(env.num_envs):
+        env._phm_fault_hold_until_step = torch.zeros((env.num_envs,), device=device, dtype=torch.long)
+    if fault_mode != "single_motor_random" or fault_hold_steps <= 0:
+        env._phm_fault_hold_motor_id[env_ids] = -1
+        env._phm_fault_hold_until_step[env_ids] = 0
     # Reset fault bookkeeping for selected envs before scenario assignment.
     if hasattr(env.phm_state, "fault_mask"):
         env.phm_state.fault_mask[env_ids] = 0.0
     if hasattr(env.phm_state, "fault_motor_id"):
         env.phm_state.fault_motor_id[env_ids] = -1
+    env._phm_scenario_id[env_ids] = 0
 
     def _set_case_from_coil(ids: torch.Tensor, delta_low: float, delta_high: float):
         if not hasattr(env.phm_state, "motor_case_temp"):
@@ -1081,6 +1120,38 @@ def reset_phm_interface(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
         # Single-motor modes: only one joint per env is degraded at reset.
         if fault_mode == "single_motor_fixed":
             motor_idx = torch.full((n,), int(fixed_motor_id), device=device, dtype=torch.long)
+        elif fault_mode == "single_motor_random":
+            env_indices = ids.to(device=device, dtype=torch.long)
+            motor_idx = torch.full((n,), -1, device=device, dtype=torch.long)
+
+            if fault_hold_steps > 0:
+                held_motor = env._phm_fault_hold_motor_id[env_indices]
+                held_until = env._phm_fault_hold_until_step[env_indices]
+                reuse_mask = (held_until > int(current_step)) & (held_motor >= 0) & (held_motor < NUM_MOTORS)
+                if torch.any(reuse_mask):
+                    motor_idx[reuse_mask] = held_motor[reuse_mask]
+            else:
+                reuse_mask = torch.zeros((n,), device=device, dtype=torch.bool)
+
+            sample_mask = ~reuse_mask
+            sample_count = int(torch.sum(sample_mask).item())
+            if sample_count > 0:
+                if pair_uniform_enabled:
+                    mirror_pairs = torch.as_tensor(_FAULT_MIRROR_PAIRS_12, device=device, dtype=torch.long)
+                    pair_idx = torch.randint(0, int(mirror_pairs.shape[0]), (sample_count,), device=device)
+                    side_idx = torch.randint(0, 2, (sample_count,), device=device)
+                    sampled_motor = mirror_pairs[pair_idx, side_idx]
+                else:
+                    sampled_motor = torch.randint(0, NUM_MOTORS, (sample_count,), device=device, dtype=torch.long)
+                motor_idx[sample_mask] = sampled_motor
+
+            # Update/refresh hold window for all just-reset environments.
+            if fault_hold_steps > 0:
+                env._phm_fault_hold_motor_id[env_indices] = motor_idx
+                env._phm_fault_hold_until_step[env_indices] = int(current_step + fault_hold_steps)
+            else:
+                env._phm_fault_hold_motor_id[env_indices] = -1
+                env._phm_fault_hold_until_step[env_indices] = 0
         else:
             motor_idx = torch.randint(0, NUM_MOTORS, (n,), device=device, dtype=torch.long)
         row_idx = torch.arange(n, device=device, dtype=torch.long)
@@ -1100,6 +1171,7 @@ def reset_phm_interface(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
     mask_fresh = rand < c_fresh
     if torch.any(mask_fresh):
         ids = env_ids[mask_fresh]
+        env._phm_scenario_id[ids] = 1
         env.phm_state.fatigue_index[ids] = 0.0
         env.phm_state.motor_health_capacity[ids] = 1.0
         env.phm_state.coil_temp[ids] = T_AMB
@@ -1111,6 +1183,7 @@ def reset_phm_interface(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
     mask_used = (rand >= c_fresh) & (rand < c_used)
     if torch.any(mask_used):
         ids = env_ids[mask_used]
+        env._phm_scenario_id[ids] = 2
         used_fatigue, used_health, used_coil, used_fault_mask, used_fault_motor = _sample_fault_profile(
             ids=ids,
             fatigue_low=0.1,
@@ -1135,6 +1208,7 @@ def reset_phm_interface(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
     mask_aged = (rand >= c_used) & (rand < c_aged)
     if torch.any(mask_aged):
         ids = env_ids[mask_aged]
+        env._phm_scenario_id[ids] = 3
         aged_fatigue, aged_health, aged_coil, aged_fault_mask, aged_fault_motor = _sample_fault_profile(
             ids=ids,
             fatigue_low=0.4,
@@ -1191,6 +1265,7 @@ def reset_phm_interface(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
     mask_crit = rand >= c_aged
     if torch.any(mask_crit):
         ids = env_ids[mask_crit]
+        env._phm_scenario_id[ids] = 4
         crit_fatigue, crit_health, crit_coil, crit_fault_mask, crit_fault_motor = _sample_fault_profile(
             ids=ids,
             fatigue_low=0.7,

@@ -5,7 +5,6 @@ from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import TerminationTermCfg as TermTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import GaussianNoiseCfg, UniformNoiseCfg
@@ -206,10 +205,12 @@ class RealObsRewardsCfg:
 
 @configclass
 class RealObsTerminationsCfg(TerminationsCfg):
-    thermal_failure = TermTerm(
-        func=phm_mdp.thermal_runaway,
-        params={"threshold_temp": 72.0, "use_case_proxy": True, "coil_to_case_delta_c": 5.0},
-    )
+    # Main RealObs-v1: thermal termination is intentionally disabled.
+    # Reason:
+    # - Current protocol uses thermal safety as soft constraint (reward + PHM dynamics),
+    #   and the hard kill path was consistently inactive/noisy for the main claim.
+    # - Thermal hard-failure experiments are handled in side ablations (TempDose, etc.).
+    thermal_failure = None
 
 
 @configclass
@@ -225,7 +226,7 @@ class UnitreeGo2RealObsEnvCfg(ManagerBasedRLEnvCfg):
     commands: CommandsCfg = CommandsCfg()
 
     curriculum = None
-    curriculum_total_steps: int = 72_000
+    curriculum_total_steps: int = 120_000
     phm_curriculum_use_performance_gate: bool = False
     phm_curriculum_steps_per_iter: int = 24
     phm_curriculum_used_start_iter: int = 1601
@@ -233,8 +234,31 @@ class UnitreeGo2RealObsEnvCfg(ManagerBasedRLEnvCfg):
     phm_curriculum_aged_end_iter: int = 2400
     phm_curriculum_critical_end_iter: int = 2800
     phm_curriculum_final_end_iter: int = 3000
+    # Explicit metric semantics for logs/evaluate (avoid implicit dependence on termination cfg).
+    temperature_metric_semantics: str = "case_proxy"
     phm_fault_injection_mode: str = "single_motor_random"
     phm_fault_fixed_motor_id: int = -1
+    phm_fault_pair_uniform_enable: bool = True
+    phm_fault_hold_steps: int = 1000
+    phm_scenario_id_critical: int = 4
+    critical_governor_enable: bool = True
+    critical_governor_v_cap_norm: float = 0.15
+    critical_governor_wz_cap: float = 0.0
+    critical_governor_ramp_tau_s: float = 2.0
+    critical_governor_p_stand_high: float = 0.25
+    critical_governor_stand_trigger_norm: float = 0.20
+    critical_governor_latch_hold_steps: int = 100
+    critical_governor_unlatch_stable_steps: int = 50
+    critical_governor_unlatch_cmd_norm: float = 0.10
+    critical_governor_unlatch_require_low_cmd: bool = True
+    critical_governor_unlatch_require_sat_recovery: bool = False
+    critical_governor_pose_roll_pitch_max_rad: float = 0.25
+    critical_governor_pose_height_margin_m: float = 0.05
+    critical_governor_sat_thr: float = 0.99
+    critical_governor_sat_window_steps: int = 15
+    critical_governor_sat_trigger: float = 0.95
+    critical_governor_sat_trigger_hi: float = 0.95
+    critical_governor_sat_trigger_lo: float = 0.95
     voltage_sensor_bias_range_v: tuple[float, float] = (-0.12, 0.12)
     encoder_pos_noise_std_rad: float = 0.005
     encoder_vel_noise_std_rads: float = 0.03
