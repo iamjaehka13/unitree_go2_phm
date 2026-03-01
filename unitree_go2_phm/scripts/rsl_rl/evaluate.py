@@ -1228,9 +1228,11 @@ def run_evaluation(
     ep_crit_prev_latched = torch.zeros(num_envs, dtype=torch.bool)
     ep_crit_first_latch_step = torch.full((num_envs,), -1, dtype=torch.long)
     ep_crit_first_unlatch_step = torch.full((num_envs,), -1, dtype=torch.long)
+    ep_crit_first_unlatch_after_zero_step = torch.full((num_envs,), -1, dtype=torch.long)
     ep_crit_sat_ratio_step_history = [[] for _ in range(num_envs)]
     ep_crit_sat_ratio_step_history_latched = [[] for _ in range(num_envs)]
     ep_crit_post_unlatch_sat_history = [[] for _ in range(num_envs)]
+    ep_max_saturation_step_history = [[] for _ in range(num_envs)]
     ep_cmd_target = torch.zeros((num_envs, 3), device=base_env.device, dtype=torch.float32)
     governor_mode_names = ("none", "v_cap", "stand", "stop_latch", "other")
 
@@ -1327,6 +1329,10 @@ def run_evaluation(
     walk_progress_min = float(cls_walk_progress_min)
     walk_progress_speed_min = float(cls_walk_progress_speed_min)
     walk_progress_ratio_min = float(cls_walk_progress_ratio_min)
+    post_unlatch_ignore_s = 0.5
+    post_unlatch_window_s = 2.0
+    post_unlatch_ignore_steps = max(int(round(post_unlatch_ignore_s / max(dt, 1e-6))), 0)
+    post_unlatch_window_steps = max(int(round(post_unlatch_window_s / max(dt, 1e-6))), 1)
     safe_stop_lin_vel_max = float(max(safe_stop_lin_vel_max, 0.0))
     safe_stop_ang_vel_max = float(max(safe_stop_ang_vel_max, 0.0))
     safe_stop_hold_s = float(max(safe_stop_hold_s, dt))
@@ -1708,6 +1714,17 @@ def run_evaluation(
             & (ep_crit_first_latch_step >= 0)
         )
         ep_crit_first_unlatch_step[first_unlatch_mask] = step_index_now[first_unlatch_mask]
+        if forced_walk_then_zero_enabled:
+            step_time_now_s = step_index_now.to(torch.float32) * float(dt)
+            unlatch_after_zero_mask = latch_ended & (step_time_now_s >= float(forced_walk_then_zero_walk_s))
+            first_unlatch_after_zero_mask = (
+                (ep_crit_first_unlatch_after_zero_step < 0)
+                & unlatch_after_zero_mask
+                & (ep_crit_first_latch_step >= 0)
+            )
+            ep_crit_first_unlatch_after_zero_step[first_unlatch_after_zero_mask] = step_index_now[
+                first_unlatch_after_zero_mask
+            ]
         ep_crit_latch_event_count += latch_started.to(torch.float32)
         ep_crit_latch_open_run_steps = torch.where(
             latched_bool,
@@ -1762,6 +1779,7 @@ def run_evaluation(
                 ep_peak_temp_c[i] = float(max_temp)
             if float(max_saturation) > float(ep_peak_saturation[i].item()):
                 ep_peak_saturation[i] = float(max_saturation)
+            ep_max_saturation_step_history[i].append(float(max_saturation))
             if int(ep_crit_first_unlatch_step[i].item()) >= 0:
                 ep_crit_post_unlatch_sat_history[i].append(float(max_saturation))
 
@@ -1814,9 +1832,11 @@ def run_evaluation(
                     ep_crit_prev_latched[idx] = False
                     ep_crit_first_latch_step[idx] = -1
                     ep_crit_first_unlatch_step[idx] = -1
+                    ep_crit_first_unlatch_after_zero_step[idx] = -1
                     ep_crit_sat_ratio_step_history[idx] = []
                     ep_crit_sat_ratio_step_history_latched[idx] = []
                     ep_crit_post_unlatch_sat_history[idx] = []
+                    ep_max_saturation_step_history[idx] = []
                     ep_gait_valid_steps[idx] = 0.0
                     ep_gait_quad_support_steps[idx] = 0.0
                     if num_feet > 0 and ep_gait_contact_steps is not None and ep_gait_touchdown_count is not None and ep_gait_slip_distance is not None:
@@ -1939,6 +1959,7 @@ def run_evaluation(
                     latch_mean_dur_s_ep = float("nan")
                 first_latch_step_val = int(ep_crit_first_latch_step[idx].item())
                 first_unlatch_step_val = int(ep_crit_first_unlatch_step[idx].item())
+                first_unlatch_after_zero_step_val = int(ep_crit_first_unlatch_after_zero_step[idx].item())
                 time_to_first_latch_s = (
                     float(first_latch_step_val * dt)
                     if first_latch_step_val >= 0
@@ -1956,6 +1977,19 @@ def run_evaluation(
                 unlatch_success_ep = (
                     1.0 if (first_latch_step_val >= 0 and first_unlatch_step_val >= 0) else 0.0
                 )
+                if forced_walk_then_zero_enabled:
+                    unlatch_after_zero_success_ep = (
+                        1.0 if (first_latch_step_val >= 0 and first_unlatch_after_zero_step_val >= 0) else 0.0
+                    )
+                    if first_unlatch_after_zero_step_val >= 0:
+                        time_to_unlatch_after_zero_s = float(
+                            max(0.0, first_unlatch_after_zero_step_val * dt - forced_walk_then_zero_walk_s)
+                        )
+                    else:
+                        time_to_unlatch_after_zero_s = float("nan")
+                else:
+                    unlatch_after_zero_success_ep = float("nan")
+                    time_to_unlatch_after_zero_s = float("nan")
                 crit_action_delta_latched_mean_ep = float(ep_crit_action_delta_latched_sum[idx].item() / latched_steps)
                 crit_cmd_delta_latched_mean_ep = float(ep_crit_cmd_delta_latched_sum[idx].item() / latched_steps)
                 crit_cmd_delta_active_ratio_ep = float(ep_crit_cmd_delta_active_steps[idx].item() / ep_len_safe)
@@ -2002,6 +2036,32 @@ def run_evaluation(
                     post_unlatch_peak_sat_ep = float("nan")
                     post_unlatch_peak_sat_p95_ep = float("nan")
 
+                # Fixed-window post-unlatch saturation metric (fair comparison across policies).
+                # Default: ignore 0.5s transient, then evaluate next 2.0s only.
+                fixed_unlatch_ref_step = (
+                    first_unlatch_after_zero_step_val
+                    if (forced_walk_then_zero_enabled and first_unlatch_after_zero_step_val >= 0)
+                    else first_unlatch_step_val
+                )
+                post_unlatch_fixedwin_used_steps_ep = 0.0
+                post_unlatch_fixedwin_valid_ep = 0.0
+                post_unlatch_fixedwin_peak_sat_ep = float("nan")
+                post_unlatch_fixedwin_peak_sat_p95_ep = float("nan")
+                sat_hist_all = ep_max_saturation_step_history[idx]
+                if fixed_unlatch_ref_step >= 0 and len(sat_hist_all) > 0:
+                    start_step_1b = fixed_unlatch_ref_step + int(post_unlatch_ignore_steps)
+                    start_idx = max(start_step_1b - 1, 0)
+                    end_idx = start_idx + int(post_unlatch_window_steps)
+                    if start_idx < len(sat_hist_all):
+                        window_vals = sat_hist_all[start_idx:min(end_idx, len(sat_hist_all))]
+                        used_steps = int(len(window_vals))
+                        post_unlatch_fixedwin_used_steps_ep = float(used_steps)
+                        post_unlatch_fixedwin_valid_ep = 1.0 if used_steps >= int(post_unlatch_window_steps) else 0.0
+                        if used_steps > 0:
+                            window_arr = np.array(window_vals, dtype=np.float64)
+                            post_unlatch_fixedwin_peak_sat_ep = float(np.max(window_arr))
+                            post_unlatch_fixedwin_peak_sat_p95_ep = float(np.percentile(window_arr, 95))
+
                 episode_metrics["crit_sat_any_over_thr_ratio_ep"].append(crit_sat_any_ratio_ep)
                 episode_metrics["crit_sat_window_ratio_mean_ep"].append(crit_sat_window_ratio_ep)
                 episode_metrics["crit_latched_step_ratio_ep"].append(crit_latched_ratio_ep)
@@ -2012,6 +2072,8 @@ def run_evaluation(
                 episode_metrics["crit_time_to_unlatch_s"].append(time_to_unlatch_s)
                 episode_metrics["crit_latch_recovery_delay_s"].append(latch_recovery_delay_s)
                 episode_metrics["crit_unlatch_success_ep"].append(float(unlatch_success_ep))
+                episode_metrics["crit_unlatch_after_zero_success_ep"].append(float(unlatch_after_zero_success_ep))
+                episode_metrics["crit_time_to_unlatch_after_zero_s"].append(float(time_to_unlatch_after_zero_s))
                 episode_metrics["crit_cmd_delta_active_ratio_ep"].append(crit_cmd_delta_active_ratio_ep)
                 episode_metrics["crit_cmd_delta_active_latched_ratio_ep"].append(crit_cmd_delta_active_latched_ratio_ep)
                 episode_metrics["crit_latched_low_cmd_delta_ratio_ep"].append(crit_latched_low_cmd_delta_ratio_ep)
@@ -2027,6 +2089,18 @@ def run_evaluation(
                 episode_metrics["crit_sat_ratio_latched_step_max_ep"].append(sat_ratio_latched_step_max_ep)
                 episode_metrics["crit_post_unlatch_peak_sat_ep"].append(post_unlatch_peak_sat_ep)
                 episode_metrics["crit_post_unlatch_peak_sat_p95_ep"].append(post_unlatch_peak_sat_p95_ep)
+                episode_metrics["crit_post_unlatch_fixedwin_used_steps_ep"].append(
+                    float(post_unlatch_fixedwin_used_steps_ep)
+                )
+                episode_metrics["crit_post_unlatch_fixedwin_valid_ep"].append(
+                    float(post_unlatch_fixedwin_valid_ep)
+                )
+                episode_metrics["crit_post_unlatch_fixedwin_peak_sat_ep"].append(
+                    float(post_unlatch_fixedwin_peak_sat_ep)
+                )
+                episode_metrics["crit_post_unlatch_fixedwin_peak_sat_p95_ep"].append(
+                    float(post_unlatch_fixedwin_peak_sat_p95_ep)
+                )
                 episode_metrics["crit_action_delta_latched_norm_mean_ep"].append(crit_action_delta_latched_mean_ep)
                 episode_metrics["crit_action_delta_latched_norm_max_ep"].append(
                     float(ep_crit_action_delta_latched_max[idx].item())
@@ -2233,9 +2307,11 @@ def run_evaluation(
                 ep_crit_prev_latched[idx] = False
                 ep_crit_first_latch_step[idx] = -1
                 ep_crit_first_unlatch_step[idx] = -1
+                ep_crit_first_unlatch_after_zero_step[idx] = -1
                 ep_crit_sat_ratio_step_history[idx] = []
                 ep_crit_sat_ratio_step_history_latched[idx] = []
                 ep_crit_post_unlatch_sat_history[idx] = []
+                ep_max_saturation_step_history[idx] = []
                 ep_gait_valid_steps[idx] = 0.0
                 ep_gait_quad_support_steps[idx] = 0.0
                 if num_feet > 0 and ep_gait_contact_steps is not None and ep_gait_touchdown_count is not None and ep_gait_slip_distance is not None:
@@ -2299,12 +2375,16 @@ def run_evaluation(
         "crit_latch_mean_dur_s_ep",
         "crit_time_to_first_latch_s",
         "crit_time_to_unlatch_s",
+        "crit_time_to_unlatch_after_zero_s",
         "crit_latch_recovery_delay_s",
+        "crit_unlatch_after_zero_success_ep",
         "crit_sat_ratio_latched_step_mean_ep",
         "crit_sat_ratio_latched_step_p95_ep",
         "crit_sat_ratio_latched_step_max_ep",
         "crit_post_unlatch_peak_sat_ep",
         "crit_post_unlatch_peak_sat_p95_ep",
+        "crit_post_unlatch_fixedwin_peak_sat_ep",
+        "crit_post_unlatch_fixedwin_peak_sat_p95_ep",
         "crit_governor_mode_step",
     }
     for key, values in episode_metrics.items():
@@ -2390,10 +2470,28 @@ def run_evaluation(
         "crit_latch_mean_dur_s_ep": "episode_mean_duration_seconds_per_latch_event",
         "crit_time_to_first_latch_s": "episode_time_seconds_to_first_false->true_latch (nan if no latch)",
         "crit_time_to_unlatch_s": "episode_time_seconds_to_first_true->false_unlatch_after_latch (nan if no unlatch)",
+        "crit_time_to_unlatch_after_zero_s": (
+            "forced_walk_then_zero only: max(0, first_unlatch_after_zero_time - walk_s)"
+        ),
         "crit_latch_recovery_delay_s": "crit_time_to_unlatch_s - crit_time_to_first_latch_s (nan if unavailable)",
         "crit_unlatch_success_ep": "episode_indicator[first latch occurred and later unlatch occurred]",
+        "crit_unlatch_after_zero_success_ep": (
+            "forced_walk_then_zero only: episode_indicator[first latch occurred and later unlatch occurred after zero-phase]"
+        ),
         "crit_post_unlatch_peak_sat_ep": "episode_max(max_saturation) over steps after first unlatch",
         "crit_post_unlatch_peak_sat_p95_ep": "episode_p95(max_saturation) over steps after first unlatch",
+        "crit_post_unlatch_fixedwin_used_steps_ep": (
+            "post-unlatch fixed-window sampled steps count (ignore 0.5s, then window 2.0s)"
+        ),
+        "crit_post_unlatch_fixedwin_valid_ep": (
+            "post-unlatch fixed-window validity indicator (1 if full window available else 0)"
+        ),
+        "crit_post_unlatch_fixedwin_peak_sat_ep": (
+            "episode_max(max_saturation) over fixed window after unlatch (0.5s ignore + 2.0s window)"
+        ),
+        "crit_post_unlatch_fixedwin_peak_sat_p95_ep": (
+            "episode_p95(max_saturation) over fixed window after unlatch (0.5s ignore + 2.0s window)"
+        ),
         "crit_governor_mode_step": "terminal enum {0:none,1:v_cap,2:stand,3:stop_latch,4:other}",
     }
     summary["_debug_forced_walk_ramp"] = {
@@ -2404,6 +2502,10 @@ def run_evaluation(
     summary["_debug_forced_walk_then_zero"] = {
         "enabled": bool(forced_walk_then_zero_enabled),
         "walk_s": float(forced_walk_then_zero_walk_s),
+        "post_unlatch_ignore_s": float(post_unlatch_ignore_s),
+        "post_unlatch_window_s": float(post_unlatch_window_s),
+        "post_unlatch_ignore_steps": int(post_unlatch_ignore_steps),
+        "post_unlatch_window_steps": int(post_unlatch_window_steps),
         "cmd_profile_effective": str(cmd_profile_effective),
     }
     summary["_debug_episode_classification_thresholds"] = {
@@ -2519,8 +2621,10 @@ def run_evaluation(
         "crit_latch_mean_dur_s_ep",
         "crit_time_to_first_latch_s",
         "crit_time_to_unlatch_s",
+        "crit_time_to_unlatch_after_zero_s",
         "crit_latch_recovery_delay_s",
         "crit_unlatch_success_ep",
+        "crit_unlatch_after_zero_success_ep",
         "crit_cmd_delta_active_ratio_ep",
         "crit_cmd_delta_active_latched_ratio_ep",
         "crit_latched_low_cmd_delta_ratio_ep",
@@ -2538,6 +2642,10 @@ def run_evaluation(
         "crit_sat_ratio_latched_step_max_ep",
         "crit_post_unlatch_peak_sat_ep",
         "crit_post_unlatch_peak_sat_p95_ep",
+        "crit_post_unlatch_fixedwin_used_steps_ep",
+        "crit_post_unlatch_fixedwin_valid_ep",
+        "crit_post_unlatch_fixedwin_peak_sat_ep",
+        "crit_post_unlatch_fixedwin_peak_sat_p95_ep",
         "crit_sat_any_over_thr_ratio_terminal",
     )
     for key in required_keys:
@@ -2987,7 +3095,10 @@ def print_safety_table(results: dict, temp_metric_semantics: str = "coil_hotspot
         latch_dur_s_ep = summary.get("crit_latch_mean_dur_s_ep", {}).get("mean", float("nan"))
         t_first_latch_s = summary.get("crit_time_to_first_latch_s", {}).get("mean", float("nan"))
         t_unlatch_s = summary.get("crit_time_to_unlatch_s", {}).get("mean", float("nan"))
-        post_unlatch_sat_p95 = summary.get("crit_post_unlatch_peak_sat_p95_ep", {}).get("mean", float("nan"))
+        post_unlatch_sat_p95 = summary.get(
+            "crit_post_unlatch_fixedwin_peak_sat_p95_ep",
+            summary.get("crit_post_unlatch_peak_sat_p95_ep", {}),
+        ).get("mean", float("nan"))
         action_delta_latched = summary.get("crit_action_delta_latched_norm_mean_ep", {}).get(
             "mean",
             summary.get("crit_action_delta_latched_norm_step", {}).get("mean", float("nan")),
@@ -3067,7 +3178,10 @@ def print_paper_table(results: dict, temp_metric_semantics: str = "coil_hotspot"
         latch_dur_s_ep = crit.get("crit_latch_mean_dur_s_ep", {}).get("mean", float("nan"))
         t_first_latch = crit.get("crit_time_to_first_latch_s", {}).get("mean", float("nan"))
         t_unlatch = crit.get("crit_time_to_unlatch_s", {}).get("mean", float("nan"))
-        post_unlatch_sat_p95 = crit.get("crit_post_unlatch_peak_sat_p95_ep", {}).get("mean", float("nan"))
+        post_unlatch_sat_p95 = crit.get(
+            "crit_post_unlatch_fixedwin_peak_sat_p95_ep",
+            crit.get("crit_post_unlatch_peak_sat_p95_ep", {}),
+        ).get("mean", float("nan"))
         print("  CRITICAL SAFETY METRICS")
         print(
             f"  safe_stop_success={safe_rate:.1f}% | time_to_safe_stop={t_safe:.2f}s | "

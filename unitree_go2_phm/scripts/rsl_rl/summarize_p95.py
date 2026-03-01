@@ -18,13 +18,25 @@ METRIC_SPECS: dict[str, dict[str, str]] = {
     # Recovery metrics (new default columns)
     "crit_time_to_first_latch_s": {"T1Latch_s_mean": "mean", "T1Latch_s_p95": "p95"},
     "crit_time_to_unlatch_s": {"TUnlatch_s_mean": "mean", "TUnlatch_s_p95": "p95"},
+    "crit_time_to_unlatch_after_zero_s": {
+        "TUnlatchAfterZero_s_mean": "mean",
+        "TUnlatchAfterZero_s_p95": "p95",
+    },
     "crit_post_unlatch_peak_sat_p95_ep": {
         "PostUnlatchPeakSat95_mean": "mean",
         "PostUnlatchPeakSat95_p95": "p95",
     },
+    "crit_post_unlatch_fixedwin_peak_sat_p95_ep": {
+        "PostUnlatchFixWinPeakSat95_mean": "mean",
+        "PostUnlatchFixWinPeakSat95_p95": "p95",
+    },
     "crit_unlatch_success_ep": {
         "UnlatchSucc_mean": "mean",
         "UnlatchSucc_p95": "p95",
+    },
+    "crit_unlatch_after_zero_success_ep": {
+        "UnlatchAfterZeroSucc_mean": "mean",
+        "UnlatchAfterZeroSucc_p95": "p95",
     },
 }
 
@@ -254,10 +266,16 @@ def main() -> None:
         "T1Latch_s_p95",
         "TUnlatch_s_mean",
         "TUnlatch_s_p95",
+        "TUnlatchAfterZero_s_mean",
+        "TUnlatchAfterZero_s_p95",
         "UnlatchSucc_mean",
         "UnlatchSucc_p95",
         "PostUnlatchPeakSat95_mean",
         "PostUnlatchPeakSat95_p95",
+        "UnlatchAfterZeroSucc_mean",
+        "UnlatchAfterZeroSucc_p95",
+        "PostUnlatchFixWinPeakSat95_mean",
+        "PostUnlatchFixWinPeakSat95_p95",
     ]
     for k in list(rows[0].keys()):
         if k.endswith("_count"):
